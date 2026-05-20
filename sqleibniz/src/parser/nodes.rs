@@ -485,6 +485,280 @@ node!(
     constraints: Vec<ColumnConstraint>
 );
 
+// ── Rich expression type for SELECT (and future statements) ──────────────────
+#[derive(Debug)]
+pub enum SqlExpr {
+    Literal(Token),
+    ColumnRef {
+        schema: Option<String>,
+        table: Option<String>,
+        column: String,
+    },
+    Star,
+    BindParam {
+        token: Token,
+        name: Option<String>,
+        counter: Option<Token>,
+    },
+    UnaryOp {
+        op: Token,
+        operand: Box<SqlExpr>,
+    },
+    BinaryOp {
+        left: Box<SqlExpr>,
+        op: Token,
+        right: Box<SqlExpr>,
+    },
+    FunctionCall {
+        name: String,
+        distinct: bool,
+        args: Vec<SqlExpr>,
+    },
+    WindowFunctionCall {
+        name: String,
+        distinct: bool,
+        args: Vec<SqlExpr>,
+        filter: Option<Box<SqlExpr>>,
+        over: Box<WindowOver>,
+    },
+    Paren(Box<SqlExpr>),
+    Subquery(Box<SelectStmt>),
+    Exists {
+        negated: bool,
+        subquery: Box<SelectStmt>,
+    },
+    InList {
+        expr: Box<SqlExpr>,
+        negated: bool,
+        values: Vec<SqlExpr>,
+    },
+    InSelect {
+        expr: Box<SqlExpr>,
+        negated: bool,
+        subquery: Box<SelectStmt>,
+    },
+    Between {
+        expr: Box<SqlExpr>,
+        negated: bool,
+        low: Box<SqlExpr>,
+        high: Box<SqlExpr>,
+    },
+    IsNull {
+        expr: Box<SqlExpr>,
+        negated: bool,
+    },
+    Like {
+        expr: Box<SqlExpr>,
+        negated: bool,
+        op: Keyword,
+        pattern: Box<SqlExpr>,
+        escape: Option<Box<SqlExpr>>,
+    },
+    Cast {
+        expr: Box<SqlExpr>,
+        type_name: String,
+    },
+    Case {
+        operand: Option<Box<SqlExpr>>,
+        when_clauses: Vec<(SqlExpr, SqlExpr)>,
+        else_clause: Option<Box<SqlExpr>>,
+    },
+    Collate {
+        expr: Box<SqlExpr>,
+        collation: String,
+    },
+}
+
+// ── Result column ────────────────────────────────────────────────────────────
+#[derive(Debug)]
+pub enum ResultColumn {
+    Star,
+    TableStar(String),
+    Expr {
+        expr: SqlExpr,
+        alias: Option<String>,
+    },
+}
+
+// ── FROM clause ──────────────────────────────────────────────────────────────
+#[derive(Debug)]
+pub struct FromClause {
+    pub first: TableRef,
+    pub joins: Vec<JoinItem>,
+}
+
+#[derive(Debug)]
+pub struct TableRef {
+    pub source: TableSource,
+    pub alias: Option<String>,
+    pub indexed: Option<IndexedBy>,
+}
+
+#[derive(Debug)]
+pub enum TableSource {
+    Table {
+        schema: Option<String>,
+        name: String,
+    },
+    TableFunction {
+        schema: Option<String>,
+        name: String,
+        args: Vec<SqlExpr>,
+    },
+    Subquery(Box<SelectStmt>),
+    ParenFrom(Box<FromClause>),
+}
+
+#[derive(Debug, serde::Serialize)]
+pub enum IndexedBy {
+    Indexed(String),
+    NotIndexed,
+}
+
+// ── Joins ────────────────────────────────────────────────────────────────────
+#[derive(Debug)]
+pub struct JoinItem {
+    pub natural: bool,
+    pub join_type: JoinType,
+    pub table: TableRef,
+    pub constraint: Option<JoinConstraint>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub enum JoinType {
+    Comma,
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+#[derive(Debug)]
+pub enum JoinConstraint {
+    On(SqlExpr),
+    Using(Vec<String>),
+}
+
+// ── Ordering ─────────────────────────────────────────────────────────────────
+#[derive(Debug)]
+pub struct OrderingTerm {
+    pub expr: SqlExpr,
+    pub collation: Option<String>,
+    pub asc_desc: Option<Keyword>,
+    pub nulls: Option<Keyword>,
+}
+
+// ── Compound SELECT ──────────────────────────────────────────────────────────
+#[derive(Debug, serde::Serialize)]
+pub enum CompoundOp {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+#[derive(Debug)]
+pub struct CompoundSelect {
+    pub first: SelectCore,
+    pub rest: Vec<(CompoundOp, SelectCore)>,
+}
+
+// ── SELECT core (one SELECT clause or VALUES) ────────────────────────────────
+#[derive(Debug)]
+pub struct SelectCore {
+    pub distinct: Option<Keyword>,
+    pub columns: Vec<ResultColumn>,
+    pub from: Option<FromClause>,
+    pub where_clause: Option<SqlExpr>,
+    pub group_by: Vec<SqlExpr>,
+    pub having: Option<SqlExpr>,
+    pub windows: Vec<NamedWindowDef>,
+    pub is_values: bool,
+    pub values_rows: Vec<Vec<SqlExpr>>,
+}
+
+// ── CTE ──────────────────────────────────────────────────────────────────────
+#[derive(Debug)]
+pub struct CommonTableExpr {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub materialized: Option<bool>,
+    pub select: Box<SelectStmt>,
+}
+
+// ── Window definitions ───────────────────────────────────────────────────────
+#[derive(Debug)]
+pub struct NamedWindowDef {
+    pub name: String,
+    pub def: WindowSpec,
+}
+
+#[derive(Debug)]
+pub enum WindowOver {
+    Name(String),
+    Spec(WindowSpec),
+}
+
+#[derive(Debug)]
+pub struct WindowSpec {
+    pub base_window: Option<String>,
+    pub partition_by: Vec<SqlExpr>,
+    pub order_by: Vec<OrderingTerm>,
+    pub frame: Option<FrameSpec>,
+}
+
+#[derive(Debug)]
+pub struct FrameSpec {
+    pub mode: Keyword,
+    pub start: Box<FrameBound>,
+    pub end: Option<Box<FrameBound>>,
+    pub exclude: Option<FrameExclude>,
+}
+
+#[derive(Debug)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(Box<SqlExpr>),
+    CurrentRow,
+    Following(Box<SqlExpr>),
+    UnboundedFollowing,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub enum FrameExclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+// ── SelectStmt top-level node ────────────────────────────────────────────────
+node!(
+    SelectStmt,
+    r"SELECT statement, see: https://www.sqlite.org/lang_select.html
+
+The SELECT statement is used to query the database. The result of a SELECT is zero or more rows of data where each row has a fixed number of columns.
+
+# Examples
+
+```sql
+SELECT * FROM users;
+SELECT id, name FROM users WHERE active = 1;
+SELECT COUNT(*) FROM orders GROUP BY customer_id HAVING COUNT(*) > 5;
+WITH recent AS (SELECT * FROM orders WHERE date > '2024-01-01')
+  SELECT * FROM recent;
+SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY 1;
+```
+",
+    ctes: Vec<CommonTableExpr>,
+    recursive: bool,
+    body: CompoundSelect,
+    order_by: Vec<OrderingTerm>,
+    limit: Option<SqlExpr>,
+    offset: Option<SqlExpr>
+);
+
 #[derive(Debug, serde::Serialize)]
 pub enum PragmaInvocation {
     Query,

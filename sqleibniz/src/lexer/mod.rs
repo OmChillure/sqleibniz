@@ -161,87 +161,144 @@ impl<'a> Lexer<'a> {
             match self.cur() {
                 // skipping whitespace
                 '\t' | '\r' | ' ' | '\n' => {}
-                // comments, see: https://www.sqlite.org/lang_comment.html
+                // comments or division, see: https://www.sqlite.org/lang_comment.html
                 '/' => {
                     if self.next_is('*') {
+                        // block comment /* ... */
                         while !self.is_eof() {
                             self.advance();
                             if self.is('*') && self.next_is('/') {
+                                self.advance(); // skip '*', now on '/'
                                 break;
                             }
                         }
+                    } else {
+                        r.push(self.single(Type::Slash));
                     }
                 }
-                // comments, see: https://www.sqlite.org/lang_comment.html
+                // comments or minus, see: https://www.sqlite.org/lang_comment.html
                 '-' => {
-                    // skip --
-                    self.advance();
-                    if !self.is('-') {
-                        self.errors.push(self.err(
-                            "'-' is not a valid symbol at this point",
-                            "If you meant a comment, those are prefixed with '--'",
-                            self.line_pos,
-                            Rule::Syntax,
-                        ));
-                        break;
-                    }
+                    if self.next_is('-') {
+                        // line comment --
+                        self.advance(); // skip first -
+                        self.advance(); // skip second -
 
-                    self.advance();
+                        while !self.is_eof() {
+                            if self.is('\n') {
+                                break;
+                            } else if self.is('@') {
+                                self.advance(); // skip '@'
+                                let start = self.pos;
 
-                    while !self.is_eof() {
-                        if self.is('\n') {
-                            break;
-                        } else if self.is('@') {
-                            self.advance(); // skip '@'
-                            let start = self.pos;
-
-                            while !self.is_eof() && !self.cur().is_whitespace() {
-                                self.advance();
-                            }
-
-                            let bytes = self.source.get(start..self.pos).unwrap_or_default();
-                            let instruction = String::from_utf8(bytes.to_vec()).unwrap_or_default();
-
-                            let mut err = self.err(
-                                "Unknown sqleibniz instruction",
-                                "placeholder",
-                                self.line_pos,
-                                Rule::BadSqleibnizInstruction,
-                            );
-
-                            if let Some(function) = instruction.strip_prefix("sqleibniz::") {
-                                match function {
-                                    "expect" => {
-                                        r.push(self.single(Type::InstructionExpect));
-                                    }
-                                    _ => {
-                                        err.note = format!(
-                                            "`{}` is not a valid sqleibniz instruction",
-                                            function
-                                        );
-                                        err.start = start - 1;
-                                        err.end = self.pos;
-                                        self.errors.push(err);
-                                    }
+                                while !self.is_eof() && !self.cur().is_whitespace() {
+                                    self.advance();
                                 }
-                            } else {
-                                err.note = format!(
-                                    "`{}` is not a valid sqleibniz instruction",
-                                    instruction
+
+                                let bytes = self.source.get(start..self.pos).unwrap_or_default();
+                                let instruction =
+                                    String::from_utf8(bytes.to_vec()).unwrap_or_default();
+
+                                let mut err = self.err(
+                                    "Unknown sqleibniz instruction",
+                                    "placeholder",
+                                    self.line_pos,
+                                    Rule::BadSqleibnizInstruction,
                                 );
-                                err.start = start - 1;
-                                err.end = self.pos;
-                                self.errors.push(err);
+
+                                if let Some(function) = instruction.strip_prefix("sqleibniz::") {
+                                    match function {
+                                        "expect" => {
+                                            r.push(self.single(Type::InstructionExpect));
+                                        }
+                                        _ => {
+                                            err.note = format!(
+                                                "`{}` is not a valid sqleibniz instruction",
+                                                function
+                                            );
+                                            err.start = start - 1;
+                                            err.end = self.pos;
+                                            self.errors.push(err);
+                                        }
+                                    }
+                                } else {
+                                    err.note = format!(
+                                        "`{}` is not a valid sqleibniz instruction",
+                                        instruction
+                                    );
+                                    err.start = start - 1;
+                                    err.end = self.pos;
+                                    self.errors.push(err);
+                                }
+
+                                // skip rest of the line
+                                while !self.is_eof() && !self.is('\n') {
+                                    self.advance();
+                                }
+                                break;
                             }
 
-                            // skip rest of the line
-                            while !self.is_eof() && !self.is('\n') {
-                                self.advance();
-                            }
-                            break;
+                            self.advance();
                         }
-
+                    } else {
+                        r.push(self.single(Type::Minus));
+                    }
+                }
+                '+' => r.push(self.single(Type::Plus)),
+                '~' => r.push(self.single(Type::Tilde)),
+                '&' => r.push(self.single(Type::Ampersand)),
+                '|' => {
+                    if self.next_is('|') {
+                        let tok = self.single(Type::PipePipe);
                         self.advance();
+                        r.push(tok);
+                    } else {
+                        r.push(self.single(Type::Pipe));
+                    }
+                }
+                '<' => {
+                    if self.next_is('=') {
+                        let tok = self.single(Type::LessEqual);
+                        self.advance();
+                        r.push(tok);
+                    } else if self.next_is('<') {
+                        let tok = self.single(Type::ShiftLeft);
+                        self.advance();
+                        r.push(tok);
+                    } else if self.next_is('>') {
+                        let tok = self.single(Type::LessGreater);
+                        self.advance();
+                        r.push(tok);
+                    } else {
+                        r.push(self.single(Type::Less));
+                    }
+                }
+                '>' => {
+                    if self.next_is('=') {
+                        let tok = self.single(Type::GreaterEqual);
+                        self.advance();
+                        r.push(tok);
+                    } else if self.next_is('>') {
+                        let tok = self.single(Type::ShiftRight);
+                        self.advance();
+                        r.push(tok);
+                    } else {
+                        r.push(self.single(Type::Greater));
+                    }
+                }
+                '!' => {
+                    if self.next_is('=') {
+                        let tok = self.single(Type::BangEqual);
+                        self.advance();
+                        r.push(tok);
+                    } else {
+                        let mut err = self.err(
+                            "Unknown character '!'",
+                            "did you mean '!=' (not equal)?",
+                            self.line_pos,
+                            Rule::UnknownCharacter,
+                        );
+                        err.doc_url = Some("https://www.sqlite.org/syntax/expr.html");
+                        self.errors.push(err);
                     }
                 }
                 // string, see: https://www.sqlite.org/lang_expr.html#literal_values_constants_
@@ -253,7 +310,13 @@ impl<'a> Lexer<'a> {
                 ';' => r.push(self.single(Type::Semicolon)),
                 ',' => r.push(self.single(Type::Comma)),
                 '%' => r.push(self.single(Type::Percent)),
-                '=' => r.push(self.single(Type::Equal)),
+                '=' => {
+                    let tok = self.single(Type::Equal);
+                    if self.next_is('=') {
+                        self.advance();
+                    }
+                    r.push(tok);
+                }
                 '@' => r.push(self.single(Type::At)),
                 ':' => r.push(self.single(Type::Colon)),
                 '$' => r.push(self.single(Type::Dollar)),
@@ -359,59 +422,47 @@ impl<'a> Lexer<'a> {
                     // this skips the advance at the bottom of the while loop
                     continue;
                 }
-                // blobs, see above
-                'X' | 'x' => {
+                // blobs, see above — only when followed by '
+                'X' | 'x' if self.next_is('\'') => {
                     let line_start = self.line_pos;
                     let line = self.line;
-                    if self.next_is('\'') {
-                        self.advance(); // skip X
-                        if let Ok(str_tok) = self.string() {
-                            if let Type::String(str) = &str_tok.ttype {
-                                let mut had_bad_hex = false;
-                                for (idx, c) in str.chars().enumerate() {
-                                    if !c.is_ascii_hexdigit() {
-                                        let mut err = self.err("Bad blob data", &format!("a Blob is hexadecimal data, '{}' is not valid hex (a..=f, A..=F, 0..=9)", c), line_start+2+idx, Rule::InvalidBlob);
-                                        err.end = line_start + 2 + idx;
-                                        err.doc_url = Some(
-                                            "https://www.sqlite.org/lang_expr.html#literal_values_constants_",
-                                        );
-                                        self.errors.push(err);
-                                        had_bad_hex = true;
-                                        break;
-                                    }
-                                }
-                                if had_bad_hex {
+                    self.advance(); // skip X
+                    if let Ok(str_tok) = self.string() {
+                        if let Type::String(str) = &str_tok.ttype {
+                            let mut had_bad_hex = false;
+                            for (idx, c) in str.chars().enumerate() {
+                                if !c.is_ascii_hexdigit() {
+                                    let mut err = self.err("Bad blob data", &format!("a Blob is hexadecimal data, '{}' is not valid hex (a..=f, A..=F, 0..=9)", c), line_start+2+idx, Rule::InvalidBlob);
+                                    err.end = line_start + 2 + idx;
+                                    err.doc_url = Some(
+                                        "https://www.sqlite.org/lang_expr.html#literal_values_constants_",
+                                    );
+                                    self.errors.push(err);
+                                    had_bad_hex = true;
                                     break;
                                 }
-                                r.push(Token {
-                                    line,
-                                    ttype: Type::Blob(str.as_bytes().to_vec()),
-                                    start: str_tok.start,
-                                    end: str_tok.end,
-                                });
                             }
-                        } else {
-                            let mut err = self.err(
-                                "Unterminated blob string",
-                                "a Blob is hexadecimal data prefixed with X' and postfixed with ', you forgot the closing '",
-                                line_start,
-                                Rule::InvalidBlob,
-                            );
-                            err.line = line;
-                            err.doc_url = Some(
-                                "https://www.sqlite.org/lang_expr.html#literal_values_constants_",
-                            );
-                            self.errors.push(err);
+                            if had_bad_hex {
+                                break;
+                            }
+                            r.push(Token {
+                                line,
+                                ttype: Type::Blob(str.as_bytes().to_vec()),
+                                start: str_tok.start,
+                                end: str_tok.end,
+                            });
                         }
                     } else {
                         let mut err = self.err(
-                            "Malformed blob",
-                            "a Blob is hexadecimal data prefixed with X' and postfixed with '",
-                            self.line_pos,
+                            "Unterminated blob string",
+                            "a Blob is hexadecimal data prefixed with X' and postfixed with ', you forgot the closing '",
+                            line_start,
                             Rule::InvalidBlob,
                         );
-                        err.doc_url =
-                            Some("https://www.sqlite.org/lang_expr.html#literal_values_constants_");
+                        err.line = line;
+                        err.doc_url = Some(
+                            "https://www.sqlite.org/lang_expr.html#literal_values_constants_",
+                        );
                         self.errors.push(err);
                     }
                 }
