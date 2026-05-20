@@ -281,6 +281,12 @@ impl<'a> Parser<'a> {
             Type::Keyword(Keyword::COMMIT) | Type::Keyword(Keyword::END) => self.commit_stmt(),
             Type::Keyword(Keyword::BEGIN) => self.begin_stmt(),
             Type::Keyword(Keyword::VACUUM) => self.vacuum_stmt(),
+            Type::Keyword(Keyword::CREATE) => self.create_stmt(),
+            Type::Keyword(Keyword::INSERT) | Type::Keyword(Keyword::REPLACE) => {
+                self.insert_stmt()
+            }
+            Type::Keyword(Keyword::UPDATE) => self.update_stmt(),
+            Type::Keyword(Keyword::DELETE) => self.delete_stmt(),
 
             // statement should not start with a semicolon 󰚌
             Type::Semicolon => {
@@ -784,6 +790,7 @@ impl<'a> Parser<'a> {
     }
 
     fn table_ref(&mut self) -> Option<TableRef> {
+        let ref_token = self.cur().clone();
         let source;
         if self.is(Type::BraceLeft) {
             self.advance();
@@ -948,6 +955,7 @@ impl<'a> Parser<'a> {
         };
 
         Some(TableRef {
+            token: ref_token,
             source,
             alias,
             indexed,
@@ -1614,6 +1622,7 @@ impl<'a> Parser<'a> {
 
             // Identifiers: column ref, table.column, schema.table.column, or function call
             Type::Ident(name) => {
+                let ident_token = self.cur().clone();
                 self.advance();
 
                 // function call: name(...)
@@ -1625,12 +1634,15 @@ impl<'a> Parser<'a> {
                 if self.is(Type::Dot) {
                     self.advance();
                     if let Type::Ident(name2) = self.cur().ttype.clone() {
+                        let col_token = self.cur().clone();
                         self.advance();
                         if self.is(Type::Dot) {
                             self.advance();
                             if let Type::Ident(name3) = self.cur().ttype.clone() {
+                                let col3_token = self.cur().clone();
                                 self.advance();
                                 return Some(SqlExpr::ColumnRef {
+                                    token: col3_token,
                                     schema: Some(name),
                                     table: Some(name2),
                                     column: name3,
@@ -1638,6 +1650,7 @@ impl<'a> Parser<'a> {
                             }
                         }
                         return Some(SqlExpr::ColumnRef {
+                            token: col_token,
                             schema: None,
                             table: Some(name),
                             column: name2,
@@ -1646,6 +1659,7 @@ impl<'a> Parser<'a> {
                         // table.* inside expression context (e.g. EXISTS check)
                         self.advance();
                         return Some(SqlExpr::ColumnRef {
+                            token: ident_token,
                             schema: None,
                             table: Some(name),
                             column: "*".into(),
@@ -1654,6 +1668,7 @@ impl<'a> Parser<'a> {
                 }
 
                 Some(SqlExpr::ColumnRef {
+                    token: ident_token,
                     schema: None,
                     table: None,
                     column: name,
@@ -1848,10 +1863,579 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// https://www.sqlite.org/lang_createindex.html
+    /// https://www.sqlite.org/lang_createtable.html
     #[cfg_attr(feature = "trace", trace)]
     fn create_stmt(&mut self) -> Option<Box<dyn nodes::Node>> {
-        todo!("Parser::create_stmt");
+        let t = self.cur().clone();
+        // skip CREATE
+        self.advance();
+
+        let temporary = if self.is_keyword(Keyword::TEMP) || self.is_keyword(Keyword::TEMPORARY) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        // Only TABLE is supported right now
+        if !self.is_keyword(Keyword::TABLE) {
+            let cur = self.cur().clone();
+            self.push_err(
+                "Unimplemented",
+                &format!(
+                    "CREATE {:?} is not yet supported by sqleibniz, only CREATE TABLE",
+                    cur.ttype
+                ),
+                &cur,
+                Rule::Unimplemented,
+            );
+            self.skip_until_semicolon_or_eof();
+            return None;
+        }
+        self.advance(); // skip TABLE
+
+        let if_not_exists = if self.is_keyword(Keyword::IF) {
+            self.advance();
+            self.consume_keyword(Keyword::NOT);
+            self.consume_keyword(Keyword::EXISTS);
+            true
+        } else {
+            false
+        };
+
+        // [schema.]table_name
+        let (schema, name) = match self.cur().ttype.clone() {
+            Type::Ident(first) if self.next_is(Type::Dot) => {
+                self.advance(); // skip schema
+                self.advance(); // skip dot
+                if let Type::Ident(tbl) = &self.cur().ttype {
+                    let tbl = tbl.clone();
+                    self.advance();
+                    (Some(first), tbl)
+                } else {
+                    let cur = self.cur().clone();
+                    self.push_err(
+                        "Expected table name",
+                        &format!("expected table name after schema., got {:?}", cur.ttype),
+                        &cur,
+                        Rule::Syntax,
+                    );
+                    self.skip_until_semicolon_or_eof();
+                    return None;
+                }
+            }
+            Type::Ident(tbl) => {
+                self.advance();
+                (None, tbl)
+            }
+            _ => {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected table name",
+                    &format!("expected table name, got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                self.skip_until_semicolon_or_eof();
+                return None;
+            }
+        };
+
+        // AS select_stmt  (CREATE TABLE ... AS SELECT ...)
+        if self.is_keyword(Keyword::AS) {
+            self.advance();
+            let _sel = self.select_stmt_inner();
+            self.expect_end("https://www.sqlite.org/lang_createtable.html");
+            return some_box!(nodes::CreateTable {
+                t,
+                if_not_exists,
+                schema,
+                name,
+                columns: vec![],
+                temporary,
+            });
+        }
+
+        self.consume(Type::BraceLeft);
+
+        let mut columns = vec![];
+        if !self.is(Type::BraceRight) {
+            if let Some(col) = self.column_def() {
+                columns.push(col);
+            }
+            while self.is(Type::Comma) {
+                self.advance();
+                // skip table constraints for now (PRIMARY KEY(...), UNIQUE(...), etc.)
+                if matches!(
+                    self.cur().ttype,
+                    Type::Keyword(Keyword::PRIMARY)
+                        | Type::Keyword(Keyword::UNIQUE)
+                        | Type::Keyword(Keyword::CHECK)
+                        | Type::Keyword(Keyword::FOREIGN)
+                        | Type::Keyword(Keyword::CONSTRAINT)
+                ) {
+                    // skip to matching ')' by counting braces
+                    let mut depth = 0i32;
+                    loop {
+                        if self.is_eof() {
+                            break;
+                        }
+                        if self.is(Type::BraceLeft) {
+                            depth += 1;
+                        }
+                        if self.is(Type::BraceRight) {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        if self.is(Type::Comma) && depth == 0 {
+                            // another table constraint or column
+                            break;
+                        }
+                        self.advance();
+                    }
+                    continue;
+                }
+                if self.is(Type::BraceRight) {
+                    break;
+                }
+                if let Some(col) = self.column_def() {
+                    columns.push(col);
+                }
+            }
+        }
+
+        self.consume(Type::BraceRight);
+
+        // optional WITHOUT ROWID
+        if self.is_keyword(Keyword::WITHOUT) {
+            self.advance();
+            // skip ROWID (it's an ident, not a keyword)
+            if let Type::Ident(ref s) = self.cur().ttype {
+                if s.to_uppercase() == "ROWID" {
+                    self.advance();
+                }
+            }
+        }
+
+        // optional STRICT
+        if let Type::Ident(ref s) = self.cur().ttype {
+            if s.to_uppercase() == "STRICT" {
+                self.advance();
+            }
+        }
+
+        self.expect_end("https://www.sqlite.org/lang_createtable.html");
+
+        some_box!(nodes::CreateTable {
+            t,
+            if_not_exists,
+            schema,
+            name,
+            columns,
+            temporary,
+        })
+    }
+
+    /// https://www.sqlite.org/lang_insert.html
+    #[cfg_attr(feature = "trace", trace)]
+    fn insert_stmt(&mut self) -> Option<Box<dyn nodes::Node>> {
+        let t = self.cur().clone();
+
+        // INSERT OR action | REPLACE
+        let or_action = if self.is_keyword(Keyword::REPLACE) {
+            self.advance();
+            Some(Keyword::REPLACE)
+        } else {
+            self.advance(); // skip INSERT
+            if self.is_keyword(Keyword::OR) {
+                self.advance();
+                let action = match &self.cur().ttype {
+                    Type::Keyword(
+                        k @ (Keyword::REPLACE
+                        | Keyword::ABORT
+                        | Keyword::ROLLBACK
+                        | Keyword::FAIL
+                        | Keyword::IGNORE),
+                    ) => {
+                        let k = *k;
+                        self.advance();
+                        Some(k)
+                    }
+                    _ => {
+                        let cur = self.cur().clone();
+                        self.push_err(
+                            "Expected conflict action",
+                            &format!(
+                                "expected REPLACE, ABORT, ROLLBACK, FAIL, or IGNORE after INSERT OR, got {:?}",
+                                cur.ttype
+                            ),
+                            &cur,
+                            Rule::Syntax,
+                        );
+                        None
+                    }
+                };
+                action
+            } else {
+                None
+            }
+        };
+
+        self.consume_keyword(Keyword::INTO);
+
+        // [schema.]table_name
+        let table_token = self.cur().clone();
+        let (schema, table) = match self.cur().ttype.clone() {
+            Type::Ident(first) if self.next_is(Type::Dot) => {
+                self.advance();
+                self.advance();
+                if let Type::Ident(tbl) = &self.cur().ttype {
+                    let tbl = tbl.clone();
+                    self.advance();
+                    (Some(first), tbl)
+                } else {
+                    let cur = self.cur().clone();
+                    self.push_err(
+                        "Expected table name",
+                        &format!("expected table name, got {:?}", cur.ttype),
+                        &cur,
+                        Rule::Syntax,
+                    );
+                    self.skip_until_semicolon_or_eof();
+                    return None;
+                }
+            }
+            Type::Ident(tbl) => {
+                self.advance();
+                (None, tbl)
+            }
+            _ => {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected table name",
+                    &format!("expected table name after INTO, got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                self.skip_until_semicolon_or_eof();
+                return None;
+            }
+        };
+
+        // optional column list
+        let mut columns = vec![];
+        if self.is(Type::BraceLeft) && !self.next_is(Type::Keyword(Keyword::SELECT)) {
+            // peek ahead to distinguish (col_list) from (SELECT ...)
+            // simple heuristic: if next token after '(' is an ident and the one after that
+            // is ',' or ')', it's a column list
+            let looks_like_col_list = if let Some(tok) = self.peek_at(1) {
+                matches!(tok.ttype, Type::Ident(_))
+            } else {
+                false
+            };
+
+            if looks_like_col_list {
+                self.advance(); // skip '('
+                loop {
+                    columns.push(self.consume_ident(
+                        "https://www.sqlite.org/lang_insert.html",
+                        "column_name",
+                    )?);
+                    if !self.is(Type::Comma) {
+                        break;
+                    }
+                    self.advance();
+                }
+                self.consume(Type::BraceRight);
+            }
+        }
+
+        // DEFAULT VALUES | VALUES (...) | select_stmt
+        let mut values = vec![];
+        let mut select = None;
+        let mut default_values = false;
+
+        if self.is_keyword(Keyword::DEFAULT) {
+            self.advance();
+            self.consume_keyword(Keyword::VALUES);
+            default_values = true;
+        } else if self.is_keyword(Keyword::VALUES) {
+            self.advance();
+            loop {
+                self.consume(Type::BraceLeft);
+                let mut row = vec![];
+                if !self.is(Type::BraceRight) {
+                    row.push(self.sql_expr()?);
+                    while self.is(Type::Comma) {
+                        self.advance();
+                        row.push(self.sql_expr()?);
+                    }
+                }
+                self.consume(Type::BraceRight);
+                values.push(row);
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        } else if self.is_keyword(Keyword::SELECT)
+            || self.is_keyword(Keyword::WITH)
+            || self.is_keyword(Keyword::VALUES)
+        {
+            select = Some(Box::new(self.select_stmt_inner()?));
+        } else {
+            let cur = self.cur().clone();
+            self.push_err(
+                "Expected VALUES, DEFAULT VALUES, or SELECT",
+                &format!("got {:?}", cur.ttype),
+                &cur,
+                Rule::Syntax,
+            );
+            self.skip_until_semicolon_or_eof();
+            return None;
+        }
+
+        self.expect_end("https://www.sqlite.org/lang_insert.html");
+
+        some_box!(nodes::InsertStmt {
+            t,
+            or_action,
+            schema,
+            table,
+            table_token,
+            columns,
+            values,
+            select,
+            default_values,
+        })
+    }
+
+    /// https://www.sqlite.org/lang_update.html
+    #[cfg_attr(feature = "trace", trace)]
+    fn update_stmt(&mut self) -> Option<Box<dyn nodes::Node>> {
+        let t = self.cur().clone();
+        self.advance(); // skip UPDATE
+
+        let or_action = if self.is_keyword(Keyword::OR) {
+            self.advance();
+            match &self.cur().ttype {
+                Type::Keyword(
+                    k @ (Keyword::REPLACE
+                    | Keyword::ABORT
+                    | Keyword::ROLLBACK
+                    | Keyword::FAIL
+                    | Keyword::IGNORE),
+                ) => {
+                    let k = *k;
+                    self.advance();
+                    Some(k)
+                }
+                _ => {
+                    let cur = self.cur().clone();
+                    self.push_err(
+                        "Expected conflict action",
+                        &format!("expected conflict action after UPDATE OR, got {:?}", cur.ttype),
+                        &cur,
+                        Rule::Syntax,
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // [schema.]table_name
+        let table_token = self.cur().clone();
+        let (schema, table_name) = match self.cur().ttype.clone() {
+            Type::Ident(first) if self.next_is(Type::Dot) => {
+                self.advance();
+                self.advance();
+                if let Type::Ident(tbl) = &self.cur().ttype {
+                    let tbl = tbl.clone();
+                    self.advance();
+                    (Some(first), tbl)
+                } else {
+                    let cur = self.cur().clone();
+                    self.push_err(
+                        "Expected table name",
+                        &format!("expected table name, got {:?}", cur.ttype),
+                        &cur,
+                        Rule::Syntax,
+                    );
+                    self.skip_until_semicolon_or_eof();
+                    return None;
+                }
+            }
+            Type::Ident(tbl) => {
+                self.advance();
+                (None, tbl)
+            }
+            _ => {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected table name",
+                    &format!("expected table name after UPDATE, got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                self.skip_until_semicolon_or_eof();
+                return None;
+            }
+        };
+
+        // optional alias
+        let alias = if self.is_keyword(Keyword::AS) {
+            self.advance();
+            self.consume_ident("https://www.sqlite.org/lang_update.html", "alias")
+        } else if !self.is_keyword(Keyword::SET) {
+            if let Type::Ident(n) = &self.cur().ttype {
+                let n = n.clone();
+                self.advance();
+                Some(n)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.consume_keyword(Keyword::SET);
+
+        // SET column = expr [, ...]
+        let mut set_clauses = vec![];
+        loop {
+            let column_token = self.cur().clone();
+            let col = self.consume_ident(
+                "https://www.sqlite.org/lang_update.html",
+                "column_name",
+            )?;
+            self.consume(Type::Equal);
+            let expr = self.sql_expr()?;
+            set_clauses.push(nodes::SetClause {
+                column: col,
+                column_token,
+                expr,
+            });
+            if !self.is(Type::Comma) {
+                break;
+            }
+            self.advance();
+        }
+
+        // optional FROM
+        let from = if self.is_keyword(Keyword::FROM) {
+            self.advance();
+            Some(self.from_clause()?)
+        } else {
+            None
+        };
+
+        // optional WHERE
+        let where_clause = if self.is_keyword(Keyword::WHERE) {
+            self.advance();
+            Some(self.sql_expr()?)
+        } else {
+            None
+        };
+
+        self.expect_end("https://www.sqlite.org/lang_update.html");
+
+        some_box!(nodes::UpdateStmt {
+            t,
+            or_action,
+            schema,
+            table: table_name,
+            table_token,
+            alias,
+            set_clauses,
+            from,
+            where_clause,
+        })
+    }
+
+    /// https://www.sqlite.org/lang_delete.html
+    #[cfg_attr(feature = "trace", trace)]
+    fn delete_stmt(&mut self) -> Option<Box<dyn nodes::Node>> {
+        let t = self.cur().clone();
+        self.advance(); // skip DELETE
+        self.consume_keyword(Keyword::FROM);
+
+        // [schema.]table_name
+        let table_token = self.cur().clone();
+        let (schema, table_name) = match self.cur().ttype.clone() {
+            Type::Ident(first) if self.next_is(Type::Dot) => {
+                self.advance();
+                self.advance();
+                if let Type::Ident(tbl) = &self.cur().ttype {
+                    let tbl = tbl.clone();
+                    self.advance();
+                    (Some(first), tbl)
+                } else {
+                    let cur = self.cur().clone();
+                    self.push_err(
+                        "Expected table name",
+                        &format!("expected table name, got {:?}", cur.ttype),
+                        &cur,
+                        Rule::Syntax,
+                    );
+                    self.skip_until_semicolon_or_eof();
+                    return None;
+                }
+            }
+            Type::Ident(tbl) => {
+                self.advance();
+                (None, tbl)
+            }
+            _ => {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected table name",
+                    &format!("expected table name after DELETE FROM, got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                self.skip_until_semicolon_or_eof();
+                return None;
+            }
+        };
+
+        // optional alias
+        let alias = if self.is_keyword(Keyword::AS) {
+            self.advance();
+            self.consume_ident("https://www.sqlite.org/lang_delete.html", "alias")
+        } else if !self.is_keyword(Keyword::WHERE) {
+            if let Type::Ident(n) = &self.cur().ttype {
+                let n = n.clone();
+                self.advance();
+                Some(n)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // optional WHERE
+        let where_clause = if self.is_keyword(Keyword::WHERE) {
+            self.advance();
+            Some(self.sql_expr()?)
+        } else {
+            None
+        };
+
+        self.expect_end("https://www.sqlite.org/lang_delete.html");
+
+        some_box!(nodes::DeleteStmt {
+            t,
+            schema,
+            table: table_name,
+            table_token,
+            alias,
+            where_clause,
+        })
     }
 
     /// https://www.sqlite.org/pragma.html

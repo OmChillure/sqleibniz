@@ -1,3 +1,6 @@
+/// analyzer performs semantic analysis on the AST: builds a symbol table from CREATE TABLE
+/// statements and checks DML statements against it
+pub mod analyzer;
 /// error does formatting and highlighting for errors
 pub mod error;
 /// highlight implements logic for highlighting tokens found in a string
