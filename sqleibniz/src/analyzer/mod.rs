@@ -3,7 +3,7 @@ mod tests;
 use std::collections::HashMap;
 
 use crate::{
-    error::Error,
+    error::{Error, Suggestion},
     lev,
     parser::nodes::{
         self, ColumnConstraint, DeleteStmt, FromClause, InsertStmt, JoinConstraint, Node,
@@ -198,12 +198,23 @@ impl Analyzer {
                             suggestions.join(", ")
                         )
                     };
-                    self.errors.push(self.err(
+                    let mut err = self.err(
                         "Unknown column",
                         &note,
                         &insert.table_token,
                         Rule::UnknownColumn,
-                    ));
+                    );
+                    if !suggestions.is_empty() {
+                        err.suggestion = Some(Suggestion {
+                            message: format!("Replace `{}` with `{}`", col_name, suggestions[0]),
+                            replacement: suggestions[0].clone(),
+                            start_line: insert.table_token.line,
+                            start_col: insert.table_token.start,
+                            end_line: insert.table_token.line,
+                            end_col: insert.table_token.end,
+                        });
+                    }
+                    self.errors.push(err);
                 }
             }
 
@@ -267,6 +278,25 @@ impl Analyzer {
 
         if let Some(ref where_expr) = update.where_clause {
             self.check_expr(where_expr, &scope);
+        } else {
+            let mut err = self.err(
+                "UPDATE without WHERE",
+                &format!(
+                    "UPDATE on '{}' has no WHERE clause and will affect all rows",
+                    update.table
+                ),
+                &update.table_token,
+                Rule::MissingWhere,
+            );
+            err.suggestion = Some(Suggestion {
+                message: "Add a WHERE clause to limit affected rows".into(),
+                replacement: String::new(),
+                start_line: update.table_token.line,
+                start_col: update.table_token.start,
+                end_line: update.table_token.line,
+                end_col: update.table_token.end,
+            });
+            self.errors.push(err);
         }
     }
 
@@ -284,6 +314,25 @@ impl Analyzer {
 
         if let Some(ref where_expr) = delete.where_clause {
             self.check_expr(where_expr, &scope);
+        } else {
+            let mut err = self.err(
+                "DELETE without WHERE",
+                &format!(
+                    "DELETE on '{}' has no WHERE clause and will delete all rows",
+                    delete.table
+                ),
+                &delete.table_token,
+                Rule::MissingWhere,
+            );
+            err.suggestion = Some(Suggestion {
+                message: "Add a WHERE clause to limit deleted rows".into(),
+                replacement: String::new(),
+                start_line: delete.table_token.line,
+                start_col: delete.table_token.start,
+                end_line: delete.table_token.line,
+                end_col: delete.table_token.end,
+            });
+            self.errors.push(err);
         }
     }
 
@@ -319,12 +368,23 @@ impl Analyzer {
                             suggestions.join(", ")
                         )
                     };
-                    self.errors.push(self.err(
+                    let mut err = self.err(
                         "Unknown table",
                         &note,
                         &tref.token,
                         Rule::UnknownTable,
-                    ));
+                    );
+                    if !suggestions.is_empty() {
+                        err.suggestion = Some(Suggestion {
+                            message: format!("Replace `{}` with `{}`", name, suggestions[0]),
+                            replacement: suggestions[0].clone(),
+                            start_line: tref.token.line,
+                            start_col: tref.token.start,
+                            end_line: tref.token.line,
+                            end_col: tref.token.end,
+                        });
+                    }
+                    self.errors.push(err);
                 }
             }
             TableSource::Subquery(sel) => {
@@ -379,9 +439,18 @@ impl Analyzer {
                                 suggestions.join(", ")
                             )
                         };
-                        self.errors.push(
-                            self.err("Unknown column", &note, token, Rule::UnknownColumn),
-                        );
+                        let mut err = self.err("Unknown column", &note, token, Rule::UnknownColumn);
+                        if !suggestions.is_empty() {
+                            err.suggestion = Some(Suggestion {
+                                message: format!("Replace `{}` with `{}`", column, suggestions[0]),
+                                replacement: suggestions[0].clone(),
+                                start_line: token.line,
+                                start_col: token.start,
+                                end_line: token.line,
+                                end_col: token.end,
+                            });
+                        }
+                        self.errors.push(err);
                     }
                 }
             }
@@ -389,6 +458,7 @@ impl Analyzer {
                 self.check_expr(left, scope);
                 self.check_expr(right, scope);
                 self.check_type_compat(left, op, right, scope);
+                self.check_equal_null(left, op, right);
             }
             SqlExpr::UnaryOp { operand, .. } => {
                 self.check_expr(operand, scope);
@@ -424,23 +494,33 @@ impl Analyzer {
                 self.check_select(subquery);
             }
             SqlExpr::Between {
-                expr, low, high, ..
+                expr,
+                low,
+                high,
+                negated,
             } => {
                 self.check_expr(expr, scope);
                 self.check_expr(low, scope);
                 self.check_expr(high, scope);
+                if !negated {
+                    self.check_reversed_between(low, high);
+                }
             }
             SqlExpr::IsNull { expr, .. } => self.check_expr(expr, scope),
             SqlExpr::Like {
                 expr,
                 pattern,
                 escape,
+                op,
                 ..
             } => {
                 self.check_expr(expr, scope);
                 self.check_expr(pattern, scope);
                 if let Some(e) = escape {
                     self.check_expr(e, scope);
+                }
+                if *op == crate::types::Keyword::LIKE {
+                    self.check_like_no_wildcards(pattern);
                 }
             }
             SqlExpr::Cast { expr, .. } => self.check_expr(expr, scope),
@@ -462,6 +542,109 @@ impl Analyzer {
             }
             SqlExpr::Collate { expr, .. } => self.check_expr(expr, scope),
             SqlExpr::Literal(_) | SqlExpr::Star | SqlExpr::BindParam { .. } => {}
+        }
+    }
+
+    // ── = NULL / != NULL checking ───────────────────────────────────────────
+
+    fn is_null_literal(expr: &SqlExpr) -> bool {
+        matches!(expr, SqlExpr::Literal(tok) if tok.ttype == Type::Keyword(crate::types::Keyword::NULL))
+    }
+
+    fn check_equal_null(&mut self, left: &SqlExpr, op: &Token, right: &SqlExpr) {
+        let is_eq = matches!(op.ttype, Type::Equal);
+        let is_neq = matches!(op.ttype, Type::BangEqual | Type::LessGreater);
+        if !is_eq && !is_neq {
+            return;
+        }
+        let null_on_right = Self::is_null_literal(right);
+        let null_on_left = Self::is_null_literal(left);
+        if !null_on_right && !null_on_left {
+            return;
+        }
+        let replacement = if is_eq { "IS NULL" } else { "IS NOT NULL" };
+        let op_text = if is_eq { "=" } else if matches!(op.ttype, Type::BangEqual) { "!=" } else { "<>" };
+        let mut err = self.err(
+            &format!("Use `{}` instead of `{} NULL`", replacement, op_text),
+            &format!(
+                "Comparisons with NULL using {} always yield NULL; use {} instead",
+                op_text, replacement
+            ),
+            op,
+            Rule::EqualNull,
+        );
+        err.suggestion = Some(Suggestion {
+            message: format!("Replace `{} NULL` with `{}`", op_text, replacement),
+            replacement: replacement.into(),
+            start_line: op.line,
+            start_col: op.start,
+            end_line: op.line,
+            end_col: if null_on_right {
+                // cover "= NULL" or "!= NULL"
+                op.end + 5 // " NULL" is 5 chars after the operator end
+            } else {
+                op.end
+            },
+        });
+        self.errors.push(err);
+    }
+
+    // ── LIKE without wildcards ────────────────────────────────────────────────
+
+    fn check_like_no_wildcards(&mut self, pattern: &SqlExpr) {
+        if let SqlExpr::Literal(tok) = pattern {
+            if let Type::String(ref s) = tok.ttype {
+                if !s.contains('%') && !s.contains('_') {
+                    let mut err = self.err(
+                        "LIKE pattern has no wildcards",
+                        &format!(
+                            "Pattern '{}' contains no % or _ wildcards; consider using = for exact match",
+                            s
+                        ),
+                        tok,
+                        Rule::LikeNoWildcards,
+                    );
+                    err.suggestion = Some(Suggestion {
+                        message: format!("Replace `LIKE '{}'` with `= '{}'`", s, s),
+                        replacement: format!("= '{}'", s),
+                        start_line: tok.line,
+                        start_col: tok.start,
+                        end_line: tok.line,
+                        end_col: tok.end,
+                    });
+                    self.errors.push(err);
+                }
+            }
+        }
+    }
+
+    // ── Reversed BETWEEN bounds ───────────────────────────────────────────────
+
+    fn check_reversed_between(&mut self, low: &SqlExpr, high: &SqlExpr) {
+        // Only check when both are numeric literals
+        if let (SqlExpr::Literal(low_tok), SqlExpr::Literal(high_tok)) = (low, high) {
+            if let (Type::Number(lo), Type::Number(hi)) = (&low_tok.ttype, &high_tok.ttype) {
+                if lo > hi {
+                    let mut err = self.err(
+                        "Reversed BETWEEN bounds",
+                        &format!(
+                            "BETWEEN {} AND {} will never match because {} > {}; swap the bounds",
+                            lo, hi, lo, hi
+                        ),
+                        low_tok,
+                        Rule::ReversedBetween,
+                    );
+                    err.suggestion = Some(Suggestion {
+                        message: format!("Swap bounds: `BETWEEN {} AND {}`", hi, lo),
+                        replacement: format!("{}", hi),
+                        start_line: low_tok.line,
+                        start_col: low_tok.start,
+                        end_line: low_tok.line,
+                        end_col: low_tok.end,
+                    });
+                    self.errors.push(err);
+                }
+            }
         }
     }
 
@@ -573,8 +756,18 @@ impl Analyzer {
                 suggestions.join(", ")
             )
         };
-        self.errors
-            .push(self.err("Unknown table", &note, token, Rule::UnknownTable));
+        let mut err = self.err("Unknown table", &note, token, Rule::UnknownTable);
+        if !suggestions.is_empty() {
+            err.suggestion = Some(Suggestion {
+                message: format!("Replace `{}` with `{}`", name, suggestions[0]),
+                replacement: suggestions[0].clone(),
+                start_line: token.line,
+                start_col: token.start,
+                end_line: token.line,
+                end_col: token.end,
+            });
+        }
+        self.errors.push(err);
         None
     }
 
@@ -600,8 +793,18 @@ impl Analyzer {
                 suggestions.join(", ")
             )
         };
-        self.errors
-            .push(self.err("Unknown column", &note, token, Rule::UnknownColumn));
+        let mut err = self.err("Unknown column", &note, token, Rule::UnknownColumn);
+        if !suggestions.is_empty() {
+            err.suggestion = Some(Suggestion {
+                message: format!("Replace `{}` with `{}`", column, suggestions[0]),
+                replacement: suggestions[0].clone(),
+                start_line: token.line,
+                start_col: token.start,
+                end_line: token.line,
+                end_col: token.end,
+            });
+        }
+        self.errors.push(err);
     }
 
     // ── Suggestions via Levenshtein distance ─────────────────────────────────
@@ -651,6 +854,7 @@ impl Analyzer {
             start: token.start,
             end: token.end,
             doc_url: None,
+            suggestion: None,
         }
     }
 }

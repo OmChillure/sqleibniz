@@ -4,7 +4,7 @@ use nodes::{BindParameter, SchemaTableContainer};
 use sqleibniz_proc::trace;
 
 use crate::{
-    error::{Error, ImprovedLine},
+    error::{Error, ImprovedLine, Suggestion},
     parser::nodes::{
         ColumnConstraint, CommonTableExpr, CompoundOp, CompoundSelect, ForeignKeyAction,
         ForeignKeyClause, ForeignKeyMatch, FrameBound, FrameExclude, FrameSpec, FromClause,
@@ -81,6 +81,7 @@ impl<'a> Parser<'a> {
             start: start.start,
             end: start.end,
             doc_url: None,
+            suggestion: None,
         }
     }
 
@@ -134,6 +135,14 @@ impl<'a> Parser<'a> {
                 err.improved_line = Some(ImprovedLine {
                     snippet: ";",
                     start: self.cur().end,
+                });
+                err.suggestion = Some(Suggestion {
+                    message: "Add `;` to terminate the statement".into(),
+                    replacement: ";".into(),
+                    start_line: cur.line,
+                    start_col: cur.start,
+                    end_line: cur.line,
+                    end_col: cur.start,
                 });
             }
             err.doc_url = Some("https://www.sqlite.org/syntax/sql-stmt.html");
@@ -324,6 +333,7 @@ impl<'a> Parser<'a> {
             Type::Ident(ref name) => {
                 let suggestions = Keyword::suggestions(name);
                 if !suggestions.is_empty() {
+                    let cur = self.cur().clone();
                     let mut err = self.err(
                         "Unknown Keyword",
                         &format!(
@@ -331,10 +341,18 @@ impl<'a> Parser<'a> {
                             name,
                             suggestions.join(", ").as_str()
                         ),
-                        self.cur(),
+                        &cur,
                         Rule::UnknownKeyword,
                     );
                     err.doc_url = Some("https://sqlite.org/lang_keywords.html");
+                    err.suggestion = Some(Suggestion {
+                        message: format!("Replace `{}` with `{}`", name, suggestions[0]),
+                        replacement: suggestions[0].to_string(),
+                        start_line: cur.line,
+                        start_col: cur.start,
+                        end_line: cur.line,
+                        end_col: cur.end,
+                    });
                     self.errors.push(err);
                 } else {
                     self.push_err(
@@ -525,6 +543,40 @@ impl<'a> Parser<'a> {
         // ── Result columns ──
         let mut columns = vec![];
         loop {
+            // detect trailing comma: comma followed by FROM / WHERE / GROUP / etc.
+            if !columns.is_empty()
+                && matches!(
+                    self.cur().ttype,
+                    Type::Keyword(Keyword::FROM)
+                        | Type::Keyword(Keyword::WHERE)
+                        | Type::Keyword(Keyword::GROUP)
+                        | Type::Keyword(Keyword::ORDER)
+                        | Type::Keyword(Keyword::LIMIT)
+                        | Type::Keyword(Keyword::UNION)
+                        | Type::Keyword(Keyword::INTERSECT)
+                        | Type::Keyword(Keyword::EXCEPT)
+                        | Type::Keyword(Keyword::WINDOW)
+                        | Type::Semicolon
+                )
+            {
+                let cur = self.cur().clone();
+                let mut err = self.err(
+                    "Trailing comma",
+                    "Remove the trailing comma before this keyword",
+                    &cur,
+                    Rule::TrailingComma,
+                );
+                err.suggestion = Some(Suggestion {
+                    message: "Remove the trailing comma".into(),
+                    replacement: String::new(),
+                    start_line: cur.line,
+                    start_col: cur.start.saturating_sub(2),
+                    end_line: cur.line,
+                    end_col: cur.start,
+                });
+                self.errors.push(err);
+                break;
+            }
             columns.push(self.result_column()?);
             if !self.is(Type::Comma) {
                 break;
@@ -3599,6 +3651,7 @@ impl<'a> Parser<'a> {
                 start: tok.start,
                 end: tok.end,
                 doc_url: Some("https://www.sqlite.org/quirks.html#the_datatype_is_optional"),
+                suggestion: None,
             };
             self.errors.push(err);
         }

@@ -52,6 +52,10 @@ struct Cli {
     /// invoke sqleibniz as a language server
     #[arg(long)]
     lsp: bool,
+
+    /// show quick-fix suggestions next to each diagnostic
+    #[arg(long)]
+    suggest: bool,
     // TODO: add a --doc <fuzzy ast node / ast name> to print node documentation
 }
 
@@ -243,15 +247,33 @@ fn main() {
             let error_count = processed_errors.len();
             for (i, e) in processed_errors.iter_mut().enumerate() {
                 if args.kiss {
-                    println!(
-                        "{}: {}, {} at l:{}:{}-{}",
-                        e.rule.name(),
-                        e.msg,
-                        e.note,
-                        e.line,
-                        e.start,
-                        e.end
-                    );
+                    if args.suggest {
+                        let fix = e
+                            .suggestion
+                            .as_ref()
+                            .map(|s| format!(" [fix: {}]", s.message))
+                            .unwrap_or_default();
+                        println!(
+                            "{}: {}, {} at l:{}:{}-{}{}",
+                            e.rule.name(),
+                            e.msg,
+                            e.note,
+                            e.line,
+                            e.start,
+                            e.end,
+                            fix
+                        );
+                    } else {
+                        println!(
+                            "{}: {}, {} at l:{}:{}-{}",
+                            e.rule.name(),
+                            e.msg,
+                            e.note,
+                            e.line,
+                            e.start,
+                            e.end
+                        );
+                    }
                 } else {
                     e.print(&mut error_string_builder, &content, &toks);
                 }

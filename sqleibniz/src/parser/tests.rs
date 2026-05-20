@@ -1048,3 +1048,106 @@ mod should_fail {
         select_bad_case:            "SELECT CASE WHEN THEN 1 END;"
     }
 }
+
+#[cfg(test)]
+mod suggestion_tests {
+    use crate::{lexer::Lexer, parser::Parser, types::rules::Rule};
+
+    /// Helper: lex + parse, return parser errors with suggestions
+    fn parse_errors(input: &str) -> Vec<(Rule, Option<String>, Option<String>)> {
+        let bytes = input.as_bytes().to_vec();
+        let mut l = Lexer::new(&bytes, "test");
+        let toks = l.run();
+        assert!(l.errors.is_empty(), "lexer errors: {:?}", l.errors);
+
+        let mut parser = Parser::new(toks, "test");
+        let _ = parser.parse();
+        parser
+            .errors
+            .iter()
+            .map(|e| {
+                (
+                    e.rule.clone(),
+                    e.suggestion.as_ref().map(|s| s.message.clone()),
+                    e.suggestion.as_ref().map(|s| s.replacement.clone()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn missing_semicolon_has_suggestion() {
+        let errs = parse_errors("SELECT 1");
+        let semi_err = errs.iter().find(|(r, _, _)| *r == Rule::Semicolon);
+        assert!(
+            semi_err.is_some(),
+            "expected Semicolon error, got: {:?}",
+            errs
+        );
+        let suggestion = &semi_err.unwrap().1;
+        assert!(
+            suggestion.is_some(),
+            "expected suggestion for missing semicolon"
+        );
+        assert!(
+            suggestion.as_ref().unwrap().contains(";"),
+            "suggestion should mention semicolon"
+        );
+        assert_eq!(semi_err.unwrap().2.as_deref(), Some(";"));
+    }
+
+    #[test]
+    fn misspelled_keyword_has_suggestion() {
+        let errs = parse_errors("SLECT 1;");
+        let kw_err = errs.iter().find(|(r, _, _)| *r == Rule::UnknownKeyword);
+        assert!(
+            kw_err.is_some(),
+            "expected UnknownKeyword error, got: {:?}",
+            errs
+        );
+        let suggestion = &kw_err.unwrap().1;
+        assert!(
+            suggestion.is_some(),
+            "expected suggestion for misspelled keyword"
+        );
+        assert!(
+            suggestion.as_ref().unwrap().contains("SELECT"),
+            "suggestion should offer SELECT as replacement"
+        );
+        assert_eq!(kw_err.unwrap().2.as_deref(), Some("SELECT"));
+    }
+
+    #[test]
+    fn trailing_comma_detected() {
+        let errs = parse_errors("SELECT a, FROM t;");
+        let tc_err = errs.iter().find(|(r, _, _)| *r == Rule::TrailingComma);
+        assert!(
+            tc_err.is_some(),
+            "expected TrailingComma error, got: {:?}",
+            errs
+        );
+        let suggestion = &tc_err.unwrap().1;
+        assert!(suggestion.is_some(), "expected suggestion for trailing comma");
+    }
+
+    #[test]
+    fn no_trailing_comma_for_valid_list() {
+        let errs = parse_errors("SELECT a, b FROM t;");
+        let tc_err = errs.iter().find(|(r, _, _)| *r == Rule::TrailingComma);
+        assert!(
+            tc_err.is_none(),
+            "should not have TrailingComma for valid list"
+        );
+    }
+
+    #[test]
+    fn trailing_comma_before_semicolon() {
+        let errs = parse_errors("SELECT a,;");
+        let tc_err = errs.iter().find(|(r, _, _)| *r == Rule::TrailingComma);
+        assert!(
+            tc_err.is_some(),
+            "expected TrailingComma before semicolon, got: {:?}",
+            errs
+        );
+    }
+}

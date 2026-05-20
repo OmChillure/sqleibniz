@@ -1,6 +1,6 @@
 use std::f64;
 
-use crate::error::{self, Error, ImprovedLine};
+use crate::error::{self, Error, ImprovedLine, Suggestion};
 use crate::types::{Keyword, Token, Type, rules::Rule};
 
 mod tests;
@@ -47,6 +47,7 @@ impl<'a> Lexer<'a> {
             start,
             end: self.line_pos,
             doc_url: None,
+            suggestion: None,
         }
     }
 
@@ -117,6 +118,14 @@ impl<'a> Lexer<'a> {
                 err.improved_line = Some(ImprovedLine {
                     snippet: "'",
                     start: err.end,
+                });
+                err.suggestion = Some(Suggestion {
+                    message: "Close string with `'`".into(),
+                    replacement: "'".into(),
+                    start_line: line,
+                    start_col: end + 1,
+                    end_line: line,
+                    end_col: end + 1,
                 });
                 return Err(Box::new(err));
             } else if self.is('\'') {
@@ -298,6 +307,71 @@ impl<'a> Lexer<'a> {
                             Rule::UnknownCharacter,
                         );
                         err.doc_url = Some("https://www.sqlite.org/syntax/expr.html");
+                        err.suggestion = Some(Suggestion {
+                            message: "Replace `!` with `!=`".into(),
+                            replacement: "!=".into(),
+                            start_line: self.line,
+                            start_col: self.line_pos,
+                            end_line: self.line,
+                            end_col: self.line_pos + 1,
+                        });
+                        self.errors.push(err);
+                    }
+                }
+                // double-quoted strings — suggest single quotes
+                '"' => {
+                    let dq_start = self.line_pos;
+                    let dq_line = self.line;
+                    self.advance(); // skip opening "
+                    let content_start = self.pos;
+                    while !self.is_eof() && !self.is('"') && !self.is('\n') {
+                        self.advance();
+                    }
+                    let content = String::from_utf8(
+                        self.source.get(content_start..self.pos).unwrap_or_default().to_vec()
+                    ).unwrap_or_default();
+                    if !self.is_eof() && self.is('"') {
+                        let dq_end = self.line_pos + 1;
+                        let mut err = self.err(
+                            "Wrong quote style",
+                            "SQL strings use single quotes ('), double quotes (\") are for identifiers",
+                            dq_start,
+                            Rule::Syntax,
+                        );
+                        err.end = dq_end;
+                        err.line = dq_line;
+                        err.suggestion = Some(Suggestion {
+                            message: format!("Replace `\"{}\"` with `'{}'`", content, content),
+                            replacement: format!("'{}'", content),
+                            start_line: dq_line,
+                            start_col: dq_start,
+                            end_line: dq_line,
+                            end_col: dq_end,
+                        });
+                        self.errors.push(err);
+                        // still emit the token as a string so parsing can continue
+                        r.push(Token {
+                            line: dq_line,
+                            ttype: Type::String(content),
+                            start: dq_start,
+                            end: dq_end,
+                        });
+                    } else {
+                        let mut err = self.err(
+                            "Unterminated double-quoted string",
+                            "Consider using single quotes for strings: 'text'",
+                            dq_start,
+                            Rule::UnterminatedString,
+                        );
+                        err.line = dq_line;
+                        err.suggestion = Some(Suggestion {
+                            message: "Use single-quoted strings: `'text'`".into(),
+                            replacement: format!("'{}'", content),
+                            start_line: dq_line,
+                            start_col: dq_start,
+                            end_line: dq_line,
+                            end_col: self.line_pos,
+                        });
                         self.errors.push(err);
                     }
                 }

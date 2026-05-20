@@ -162,3 +162,74 @@ mod should_fail {
         unknown: "--@sqleibniz::unknown"
     }
 }
+
+#[cfg(test)]
+mod suggestion_tests {
+    use crate::lexer::Lexer;
+    use crate::types::rules::Rule;
+
+    /// Helper: lex and return errors with their suggestions
+    fn lex_errors(input: &str) -> Vec<(Rule, Option<String>)> {
+        let bytes = input.as_bytes().to_vec();
+        let mut l = Lexer::new(&bytes, "test");
+        let _ = l.run();
+        l.errors
+            .iter()
+            .map(|e| (e.rule.clone(), e.suggestion.as_ref().map(|s| s.message.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn unterminated_string_has_suggestion() {
+        let errs = lex_errors("'hello");
+        assert!(!errs.is_empty());
+        let (rule, suggestion) = &errs[0];
+        assert_eq!(*rule, Rule::UnterminatedString);
+        assert!(suggestion.is_some(), "expected suggestion for unterminated string");
+        assert!(
+            suggestion.as_ref().unwrap().contains("'"),
+            "suggestion should mention closing quote"
+        );
+    }
+
+    #[test]
+    fn bang_without_equal_has_suggestion() {
+        let errs = lex_errors("!5");
+        assert!(!errs.is_empty());
+        let (rule, suggestion) = &errs[0];
+        assert_eq!(*rule, Rule::UnknownCharacter);
+        assert!(suggestion.is_some(), "expected suggestion for !");
+        assert!(
+            suggestion.as_ref().unwrap().contains("!="),
+            "suggestion should mention !="
+        );
+    }
+
+    #[test]
+    fn double_quote_string_has_suggestion() {
+        let errs = lex_errors("SELECT \"hello\";");
+        let dq_err = errs.iter().find(|(r, _)| *r == Rule::Syntax);
+        assert!(dq_err.is_some(), "expected Syntax error for double-quoted string, got: {:?}", errs);
+        let suggestion = &dq_err.unwrap().1;
+        assert!(suggestion.is_some(), "expected suggestion for double-quote string");
+        assert!(
+            suggestion.as_ref().unwrap().contains("'hello'"),
+            "suggestion should contain single-quoted version"
+        );
+    }
+
+    #[test]
+    fn double_quote_unterminated_has_suggestion() {
+        let errs = lex_errors("SELECT \"hello");
+        let dq_err = errs.iter().find(|(r, _)| *r == Rule::UnterminatedString);
+        assert!(dq_err.is_some(), "expected UnterminatedString for unterminated double-quote");
+        let suggestion = &dq_err.unwrap().1;
+        assert!(suggestion.is_some());
+    }
+
+    #[test]
+    fn valid_string_no_suggestion() {
+        let errs = lex_errors("'hello'");
+        assert!(errs.is_empty(), "valid string should produce no errors");
+    }
+}
