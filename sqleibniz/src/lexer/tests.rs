@@ -92,7 +92,11 @@ mod should_pass {
         empty_small: "x''"=vec![Type::Blob(vec![])],
 
         filled: "X'12345'"=vec![Type::Blob(vec![49, 50, 51, 52, 53])],
-        filled_small: "x'1234567'"=vec![Type::Blob(vec![49, 50, 51, 52, 53, 54, 55])]
+        filled_small: "x'1234567'"=vec![Type::Blob(vec![49, 50, 51, 52, 53, 54, 55])],
+
+        // standalone X/x without quote are valid identifiers
+        bare_x_upper: "X"=vec![Type::Ident(String::from("X"))],
+        bare_x_lower: "x"=vec![Type::Ident(String::from("x"))]
     }
 
     test_group_pass_assert! {
@@ -144,8 +148,7 @@ mod should_fail {
     test_group_fail! {
         blob,
         // edge cases
-        no_quotes: "X",
-        no_quotes_small: "x",
+        // Note: standalone X/x are valid identifiers, not malformed blobs
         unterminated: "X'",
         unterminated_small: "x'",
         unterminated1: "X'12819281",

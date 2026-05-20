@@ -6,7 +6,10 @@ use sqleibniz_proc::trace;
 use crate::{
     error::{Error, ImprovedLine},
     parser::nodes::{
-        ColumnConstraint, ForeignKeyAction, ForeignKeyClause, ForeignKeyMatch, Pragma,
+        ColumnConstraint, CommonTableExpr, CompoundOp, CompoundSelect, ForeignKeyAction,
+        ForeignKeyClause, ForeignKeyMatch, FrameBound, FrameExclude, FrameSpec, FromClause,
+        IndexedBy, JoinConstraint, JoinItem, JoinType, NamedWindowDef, OrderingTerm, Pragma,
+        ResultColumn, SelectCore, SqlExpr, TableRef, TableSource, WindowOver, WindowSpec,
     },
     types::{Keyword, Token, Type, rules::Rule, storage::SqliteStorageClass},
 };
@@ -149,6 +152,10 @@ impl<'a> Parser<'a> {
             .is_some_and(|tok| tok.ttype == t)
     }
 
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset)
+    }
+
     /// checks if current token is semicolon, if not pushes Rule::Syntax
     fn expect_end(&mut self, doc: &'static str) -> Option<()> {
         if !self.is(Type::Semicolon) {
@@ -258,7 +265,9 @@ impl<'a> Parser<'a> {
     #[cfg_attr(feature = "trace", trace)]
     fn sql_stmt(&mut self) -> Option<Box<dyn nodes::Node>> {
         match self.cur().ttype {
-            // TODO: add new statement starts here
+            Type::Keyword(Keyword::SELECT)
+            | Type::Keyword(Keyword::WITH)
+            | Type::Keyword(Keyword::VALUES) => self.select_stmt(),
             Type::Keyword(Keyword::PRAGMA) => self.pragma_stmt(),
             Type::Keyword(Keyword::ALTER) => self.alter_stmt(),
             Type::Keyword(Keyword::ATTACH) => self.attach_stmt(),
@@ -360,12 +369,1484 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // TODO: add new statement function here *_stmt()
-    // #[cfg_attr(feature = "trace", trace)]
-    // fn $1_stmt(&mut self) -> Option<Box<dyn nodes::Node>> {
-    //
-    //
-    // }
+    // ── SELECT statement ─────────────────────────────────────────────────────
+
+    /// https://www.sqlite.org/lang_select.html
+    fn select_stmt(&mut self) -> Option<Box<dyn nodes::Node>> {
+        let select = self.select_stmt_inner()?;
+        self.expect_end("https://www.sqlite.org/lang_select.html");
+        some_box!(select)
+    }
+
+    fn select_stmt_inner(&mut self) -> Option<nodes::SelectStmt> {
+        let t = self.cur().clone();
+
+        // ── WITH clause (CTEs) ──
+        let mut ctes = vec![];
+        let mut recursive = false;
+        if self.is_keyword(Keyword::WITH) {
+            self.advance();
+            if self.is_keyword(Keyword::RECURSIVE) {
+                recursive = true;
+                self.advance();
+            }
+            loop {
+                ctes.push(self.common_table_expr()?);
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        }
+
+        // ── First select core ──
+        let first = self.select_core()?;
+
+        // ── Compound selects (UNION / INTERSECT / EXCEPT) ──
+        let mut rest = vec![];
+        loop {
+            let op = if self.is_keyword(Keyword::UNION) {
+                self.advance();
+                if self.is_keyword(Keyword::ALL) {
+                    self.advance();
+                    CompoundOp::UnionAll
+                } else {
+                    CompoundOp::Union
+                }
+            } else if self.is_keyword(Keyword::INTERSECT) {
+                self.advance();
+                CompoundOp::Intersect
+            } else if self.is_keyword(Keyword::EXCEPT) {
+                self.advance();
+                CompoundOp::Except
+            } else {
+                break;
+            };
+            let core = self.select_core()?;
+            rest.push((op, core));
+        }
+
+        // ── ORDER BY ──
+        let mut order_by = vec![];
+        if self.is_keyword(Keyword::ORDER) {
+            self.advance();
+            self.consume_keyword(Keyword::BY);
+            loop {
+                order_by.push(self.ordering_term()?);
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        }
+
+        // ── LIMIT / OFFSET ──
+        let mut limit = None;
+        let mut offset = None;
+        if self.is_keyword(Keyword::LIMIT) {
+            self.advance();
+            limit = Some(self.sql_expr()?);
+            if self.is_keyword(Keyword::OFFSET) {
+                self.advance();
+                offset = Some(self.sql_expr()?);
+            } else if self.is(Type::Comma) {
+                self.advance();
+                // LIMIT x,y  ⟹  LIMIT y OFFSET x  (SQLite quirk)
+                offset = limit;
+                limit = Some(self.sql_expr()?);
+            }
+        }
+
+        Some(nodes::SelectStmt {
+            t,
+            ctes,
+            recursive,
+            body: CompoundSelect { first, rest },
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
+    fn select_core(&mut self) -> Option<SelectCore> {
+        // ── VALUES clause ──
+        if self.is_keyword(Keyword::VALUES) {
+            self.advance();
+            let mut rows = vec![];
+            loop {
+                self.consume(Type::BraceLeft);
+                let mut row = vec![];
+                if !self.is(Type::BraceRight) {
+                    row.push(self.sql_expr()?);
+                    while self.is(Type::Comma) {
+                        self.advance();
+                        row.push(self.sql_expr()?);
+                    }
+                }
+                self.consume(Type::BraceRight);
+                rows.push(row);
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            return Some(SelectCore {
+                distinct: None,
+                columns: vec![],
+                from: None,
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                windows: vec![],
+                is_values: true,
+                values_rows: rows,
+            });
+        }
+
+        // ── SELECT ──
+        self.consume_keyword(Keyword::SELECT);
+
+        let distinct = if self.is_keyword(Keyword::DISTINCT) {
+            self.advance();
+            Some(Keyword::DISTINCT)
+        } else if self.is_keyword(Keyword::ALL) {
+            self.advance();
+            Some(Keyword::ALL)
+        } else {
+            None
+        };
+
+        // ── Result columns ──
+        let mut columns = vec![];
+        loop {
+            columns.push(self.result_column()?);
+            if !self.is(Type::Comma) {
+                break;
+            }
+            self.advance();
+        }
+
+        // ── FROM ──
+        let from = if self.is_keyword(Keyword::FROM) {
+            self.advance();
+            Some(self.from_clause()?)
+        } else {
+            None
+        };
+
+        // ── WHERE ──
+        let where_clause = if self.is_keyword(Keyword::WHERE) {
+            self.advance();
+            Some(self.sql_expr()?)
+        } else {
+            None
+        };
+
+        // ── GROUP BY / HAVING ──
+        let mut group_by = vec![];
+        let mut having = None;
+        if self.is_keyword(Keyword::GROUP) {
+            self.advance();
+            self.consume_keyword(Keyword::BY);
+            loop {
+                group_by.push(self.sql_expr()?);
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            if self.is_keyword(Keyword::HAVING) {
+                self.advance();
+                having = Some(self.sql_expr()?);
+            }
+        }
+
+        // ── WINDOW ──
+        let mut windows = vec![];
+        if self.is_keyword(Keyword::WINDOW) {
+            self.advance();
+            loop {
+                let wname = self.consume_ident(
+                    "https://www.sqlite.org/lang_select.html",
+                    "window_name",
+                )?;
+                self.consume_keyword(Keyword::AS);
+                self.consume(Type::BraceLeft);
+                let spec = self.window_spec()?;
+                self.consume(Type::BraceRight);
+                windows.push(NamedWindowDef {
+                    name: wname,
+                    def: spec,
+                });
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        }
+
+        Some(SelectCore {
+            distinct,
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            is_values: false,
+            values_rows: vec![],
+        })
+    }
+
+    fn result_column(&mut self) -> Option<ResultColumn> {
+        // *
+        if self.is(Type::Asterisk) {
+            self.advance();
+            return Some(ResultColumn::Star);
+        }
+
+        // table.* — check for ident.dot.star
+        if let Type::Ident(_) = &self.cur().ttype {
+            if self.next_is(Type::Dot) {
+                if self
+                    .peek_at(2)
+                    .is_some_and(|t| t.ttype == Type::Asterisk)
+                {
+                    let name = match &self.cur().ttype {
+                        Type::Ident(n) => n.clone(),
+                        _ => unreachable!(),
+                    };
+                    self.advance(); // ident
+                    self.advance(); // dot
+                    self.advance(); // *
+                    return Some(ResultColumn::TableStar(name));
+                }
+            }
+        }
+
+        let expr = self.sql_expr()?;
+
+        // optional alias
+        let alias = if self.is_keyword(Keyword::AS) {
+            self.advance();
+            if let Type::Ident(n) = &self.cur().ttype {
+                let n = n.clone();
+                self.advance();
+                Some(n)
+            } else if let Type::String(n) = &self.cur().ttype {
+                let n = n.clone();
+                self.advance();
+                Some(n)
+            } else {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected alias name",
+                    &format!("expected identifier after AS, got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                None
+            }
+        } else if let Type::Ident(n) = &self.cur().ttype {
+            // implicit alias (no AS keyword) — only bare identifiers
+            let n = n.clone();
+            self.advance();
+            Some(n)
+        } else {
+            None
+        };
+
+        Some(ResultColumn::Expr { expr, alias })
+    }
+
+    // ── FROM clause parsing ──────────────────────────────────────────────────
+
+    fn from_clause(&mut self) -> Option<FromClause> {
+        let first = self.table_ref()?;
+        let mut joins = vec![];
+
+        loop {
+            if self.is(Type::Comma) {
+                self.advance();
+                let table = self.table_ref()?;
+                joins.push(JoinItem {
+                    natural: false,
+                    join_type: JoinType::Comma,
+                    table,
+                    constraint: None,
+                });
+            } else if self.is_join_start() {
+                joins.push(self.join_item()?);
+            } else {
+                break;
+            }
+        }
+
+        Some(FromClause { first, joins })
+    }
+
+    fn is_join_start(&self) -> bool {
+        matches!(
+            self.cur().ttype,
+            Type::Keyword(Keyword::JOIN)
+                | Type::Keyword(Keyword::INNER)
+                | Type::Keyword(Keyword::LEFT)
+                | Type::Keyword(Keyword::RIGHT)
+                | Type::Keyword(Keyword::FULL)
+                | Type::Keyword(Keyword::CROSS)
+                | Type::Keyword(Keyword::NATURAL)
+        )
+    }
+
+    fn join_item(&mut self) -> Option<JoinItem> {
+        let natural = if self.is_keyword(Keyword::NATURAL) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let join_type = if self.is_keyword(Keyword::LEFT) {
+            self.advance();
+            if self.is_keyword(Keyword::OUTER) {
+                self.advance();
+            }
+            self.consume_keyword(Keyword::JOIN);
+            JoinType::Left
+        } else if self.is_keyword(Keyword::RIGHT) {
+            self.advance();
+            if self.is_keyword(Keyword::OUTER) {
+                self.advance();
+            }
+            self.consume_keyword(Keyword::JOIN);
+            JoinType::Right
+        } else if self.is_keyword(Keyword::FULL) {
+            self.advance();
+            if self.is_keyword(Keyword::OUTER) {
+                self.advance();
+            }
+            self.consume_keyword(Keyword::JOIN);
+            JoinType::Full
+        } else if self.is_keyword(Keyword::CROSS) {
+            self.advance();
+            self.consume_keyword(Keyword::JOIN);
+            JoinType::Cross
+        } else if self.is_keyword(Keyword::INNER) {
+            self.advance();
+            self.consume_keyword(Keyword::JOIN);
+            JoinType::Inner
+        } else if self.is_keyword(Keyword::JOIN) {
+            self.advance();
+            JoinType::Inner
+        } else {
+            let cur = self.cur().clone();
+            self.push_err(
+                "Expected JOIN keyword",
+                &format!("got {:?}", cur.ttype),
+                &cur,
+                Rule::Syntax,
+            );
+            self.advance();
+            JoinType::Inner
+        };
+
+        let table = self.table_ref()?;
+
+        let constraint = if self.is_keyword(Keyword::ON) {
+            self.advance();
+            Some(JoinConstraint::On(self.sql_expr()?))
+        } else if self.is_keyword(Keyword::USING) {
+            self.advance();
+            self.consume(Type::BraceLeft);
+            let mut cols = vec![];
+            loop {
+                cols.push(self.consume_ident(
+                    "https://www.sqlite.org/lang_select.html",
+                    "column_name",
+                )?);
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            self.consume(Type::BraceRight);
+            Some(JoinConstraint::Using(cols))
+        } else {
+            None
+        };
+
+        Some(JoinItem {
+            natural,
+            join_type,
+            table,
+            constraint,
+        })
+    }
+
+    fn table_ref(&mut self) -> Option<TableRef> {
+        let source;
+        if self.is(Type::BraceLeft) {
+            self.advance();
+            if self.is_keyword(Keyword::SELECT)
+                || self.is_keyword(Keyword::WITH)
+                || self.is_keyword(Keyword::VALUES)
+            {
+                // subquery
+                let sel = self.select_stmt_inner()?;
+                self.consume(Type::BraceRight);
+                source = TableSource::Subquery(Box::new(sel));
+            } else {
+                // parenthesized FROM clause
+                let inner = self.from_clause()?;
+                self.consume(Type::BraceRight);
+                source = TableSource::ParenFrom(Box::new(inner));
+            }
+        } else {
+            // [schema.]table_name or table_function(args)
+            let name1 = match &self.cur().ttype {
+                Type::Ident(n) => n.clone(),
+                Type::String(n) => n.clone(),
+                _ => {
+                    let cur = self.cur().clone();
+                    self.push_err(
+                        "Expected table name",
+                        &format!("expected table name, got {:?}", cur.ttype),
+                        &cur,
+                        Rule::Syntax,
+                    );
+                    self.advance();
+                    return None;
+                }
+            };
+            self.advance();
+
+            if self.is(Type::Dot) {
+                // schema.table or schema.func()
+                self.advance();
+                let name2 = match &self.cur().ttype {
+                    Type::Ident(n) | Type::String(n) => n.clone(),
+                    _ => {
+                        let cur = self.cur().clone();
+                        self.push_err(
+                            "Expected table name after schema",
+                            &format!("got {:?}", cur.ttype),
+                            &cur,
+                            Rule::Syntax,
+                        );
+                        self.advance();
+                        return None;
+                    }
+                };
+                self.advance();
+
+                if self.is(Type::BraceLeft) {
+                    // schema.func(args)
+                    self.advance();
+                    let mut args = vec![];
+                    if !self.is(Type::BraceRight) {
+                        args.push(self.sql_expr()?);
+                        while self.is(Type::Comma) {
+                            self.advance();
+                            args.push(self.sql_expr()?);
+                        }
+                    }
+                    self.consume(Type::BraceRight);
+                    source = TableSource::TableFunction {
+                        schema: Some(name1),
+                        name: name2,
+                        args,
+                    };
+                } else {
+                    source = TableSource::Table {
+                        schema: Some(name1),
+                        name: name2,
+                    };
+                }
+            } else if self.is(Type::BraceLeft) {
+                // table_function(args) without schema
+                self.advance();
+                let mut args = vec![];
+                if !self.is(Type::BraceRight) {
+                    args.push(self.sql_expr()?);
+                    while self.is(Type::Comma) {
+                        self.advance();
+                        args.push(self.sql_expr()?);
+                    }
+                }
+                self.consume(Type::BraceRight);
+                source = TableSource::TableFunction {
+                    schema: None,
+                    name: name1,
+                    args,
+                };
+            } else {
+                source = TableSource::Table {
+                    schema: None,
+                    name: name1,
+                };
+            }
+        }
+
+        // optional alias
+        let alias = if self.is_keyword(Keyword::AS) {
+            self.advance();
+            if let Type::Ident(n) = &self.cur().ttype {
+                let n = n.clone();
+                self.advance();
+                Some(n)
+            } else if let Type::String(n) = &self.cur().ttype {
+                let n = n.clone();
+                self.advance();
+                Some(n)
+            } else {
+                None
+            }
+        } else if let Type::Ident(n) = &self.cur().ttype {
+            // implicit alias — but only if the ident is not a keyword-ish
+            // that starts a clause (ON, JOIN, WHERE, etc.)
+            if !self.is_join_start()
+                && !matches!(
+                    self.cur().ttype,
+                    Type::Keyword(Keyword::WHERE)
+                        | Type::Keyword(Keyword::GROUP)
+                        | Type::Keyword(Keyword::HAVING)
+                        | Type::Keyword(Keyword::ORDER)
+                        | Type::Keyword(Keyword::LIMIT)
+                        | Type::Keyword(Keyword::UNION)
+                        | Type::Keyword(Keyword::INTERSECT)
+                        | Type::Keyword(Keyword::EXCEPT)
+                        | Type::Keyword(Keyword::ON)
+                        | Type::Keyword(Keyword::USING)
+                        | Type::Keyword(Keyword::WINDOW)
+                )
+            {
+                let n = n.clone();
+                self.advance();
+                Some(n)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // optional INDEXED BY / NOT INDEXED
+        let indexed = if self.is_keyword(Keyword::INDEXED) {
+            self.advance();
+            self.consume_keyword(Keyword::BY);
+            let idx_name = self.consume_ident(
+                "https://www.sqlite.org/lang_select.html",
+                "index_name",
+            )?;
+            Some(IndexedBy::Indexed(idx_name))
+        } else if self.is_keyword(Keyword::NOT) && self.next_is(Type::Keyword(Keyword::INDEXED)) {
+            self.advance();
+            self.advance();
+            Some(IndexedBy::NotIndexed)
+        } else {
+            None
+        };
+
+        Some(TableRef {
+            source,
+            alias,
+            indexed,
+        })
+    }
+
+    // ── Ordering term ────────────────────────────────────────────────────────
+
+    fn ordering_term(&mut self) -> Option<OrderingTerm> {
+        let expr = self.sql_expr()?;
+
+        let collation = if self.is_keyword(Keyword::COLLATE) {
+            self.advance();
+            Some(self.consume_ident(
+                "https://www.sqlite.org/lang_select.html",
+                "collation_name",
+            )?)
+        } else {
+            None
+        };
+
+        let asc_desc =
+            if let Type::Keyword(k @ (Keyword::ASC | Keyword::DESC)) = &self.cur().ttype {
+                let k = *k;
+                self.advance();
+                Some(k)
+            } else {
+                None
+            };
+
+        let nulls = if self.is_keyword(Keyword::NULLS) {
+            self.advance();
+            if let Type::Keyword(k @ (Keyword::FIRST | Keyword::LAST)) = &self.cur().ttype {
+                let k = *k;
+                self.advance();
+                Some(k)
+            } else {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected FIRST or LAST",
+                    &format!("got {:?} after NULLS", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+        Some(OrderingTerm {
+            expr,
+            collation,
+            asc_desc,
+            nulls,
+        })
+    }
+
+    // ── CTE parsing ──────────────────────────────────────────────────────────
+
+    fn common_table_expr(&mut self) -> Option<CommonTableExpr> {
+        let name = self.consume_ident(
+            "https://www.sqlite.org/lang_select.html",
+            "cte_name",
+        )?;
+
+        let mut columns = vec![];
+        if self.is(Type::BraceLeft) {
+            self.advance();
+            loop {
+                columns.push(self.consume_ident(
+                    "https://www.sqlite.org/lang_select.html",
+                    "column_name",
+                )?);
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            self.consume(Type::BraceRight);
+        }
+
+        self.consume_keyword(Keyword::AS);
+
+        let materialized = if self.is_keyword(Keyword::NOT) {
+            self.advance();
+            self.consume_keyword(Keyword::MATERIALIZED);
+            Some(false)
+        } else if self.is_keyword(Keyword::MATERIALIZED) {
+            self.advance();
+            Some(true)
+        } else {
+            None
+        };
+
+        self.consume(Type::BraceLeft);
+        let select = self.select_stmt_inner()?;
+        self.consume(Type::BraceRight);
+
+        Some(CommonTableExpr {
+            name,
+            columns,
+            materialized,
+            select: Box::new(select),
+        })
+    }
+
+    // ── Window parsing ───────────────────────────────────────────────────────
+
+    fn window_over(&mut self) -> Option<WindowOver> {
+        if self.is(Type::BraceLeft) {
+            self.advance();
+            let spec = self.window_spec()?;
+            self.consume(Type::BraceRight);
+            Some(WindowOver::Spec(spec))
+        } else if let Type::Ident(name) = &self.cur().ttype {
+            let name = name.clone();
+            self.advance();
+            Some(WindowOver::Name(name))
+        } else {
+            let cur = self.cur().clone();
+            self.push_err(
+                "Expected window specification",
+                &format!("got {:?}", cur.ttype),
+                &cur,
+                Rule::Syntax,
+            );
+            None
+        }
+    }
+
+    fn window_spec(&mut self) -> Option<WindowSpec> {
+        let base_window = if let Type::Ident(n) = &self.cur().ttype {
+            if !matches!(
+                self.cur().ttype,
+                Type::Keyword(Keyword::PARTITION)
+                    | Type::Keyword(Keyword::ORDER)
+                    | Type::Keyword(Keyword::RANGE)
+                    | Type::Keyword(Keyword::ROWS)
+                    | Type::Keyword(Keyword::GROUPS)
+            ) {
+                let n = n.clone();
+                self.advance();
+                Some(n)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut partition_by = vec![];
+        if self.is_keyword(Keyword::PARTITION) {
+            self.advance();
+            self.consume_keyword(Keyword::BY);
+            loop {
+                partition_by.push(self.sql_expr()?);
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        }
+
+        let mut order_by = vec![];
+        if self.is_keyword(Keyword::ORDER) {
+            self.advance();
+            self.consume_keyword(Keyword::BY);
+            loop {
+                order_by.push(self.ordering_term()?);
+                if !self.is(Type::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        }
+
+        let frame = if matches!(
+            self.cur().ttype,
+            Type::Keyword(Keyword::RANGE)
+                | Type::Keyword(Keyword::ROWS)
+                | Type::Keyword(Keyword::GROUPS)
+        ) {
+            Some(self.frame_spec()?)
+        } else {
+            None
+        };
+
+        Some(WindowSpec {
+            base_window,
+            partition_by,
+            order_by,
+            frame,
+        })
+    }
+
+    fn frame_spec(&mut self) -> Option<FrameSpec> {
+        let mode = match &self.cur().ttype {
+            Type::Keyword(k @ (Keyword::RANGE | Keyword::ROWS | Keyword::GROUPS)) => {
+                let k = *k;
+                self.advance();
+                k
+            }
+            _ => {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected RANGE, ROWS, or GROUPS",
+                    &format!("got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                return None;
+            }
+        };
+
+        let (start, end) = if self.is_keyword(Keyword::BETWEEN) {
+            self.advance();
+            let s = Box::new(self.frame_bound()?);
+            self.consume_keyword(Keyword::AND);
+            let e = Box::new(self.frame_bound()?);
+            (s, Some(e))
+        } else {
+            (Box::new(self.frame_bound()?), None)
+        };
+
+        let exclude = if self.is_keyword(Keyword::EXCLUDE) {
+            self.advance();
+            if self.is_keyword(Keyword::NO) {
+                self.advance();
+                self.consume_keyword(Keyword::OTHERS);
+                Some(FrameExclude::NoOthers)
+            } else if self.is_keyword(Keyword::CURRENT) {
+                self.advance();
+                self.consume_keyword(Keyword::ROW);
+                Some(FrameExclude::CurrentRow)
+            } else if self.is_keyword(Keyword::GROUP) {
+                self.advance();
+                Some(FrameExclude::Group)
+            } else if self.is_keyword(Keyword::TIES) {
+                self.advance();
+                Some(FrameExclude::Ties)
+            } else {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected EXCLUDE option",
+                    &format!("got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+        Some(FrameSpec {
+            mode,
+            start,
+            end,
+            exclude,
+        })
+    }
+
+    fn frame_bound(&mut self) -> Option<FrameBound> {
+        if self.is_keyword(Keyword::UNBOUNDED) {
+            self.advance();
+            if self.is_keyword(Keyword::PRECEDING) {
+                self.advance();
+                Some(FrameBound::UnboundedPreceding)
+            } else if self.is_keyword(Keyword::FOLLOWING) {
+                self.advance();
+                Some(FrameBound::UnboundedFollowing)
+            } else {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected PRECEDING or FOLLOWING",
+                    &format!("got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                None
+            }
+        } else if self.is_keyword(Keyword::CURRENT) {
+            self.advance();
+            self.consume_keyword(Keyword::ROW);
+            Some(FrameBound::CurrentRow)
+        } else {
+            let expr = self.sql_expr()?;
+            if self.is_keyword(Keyword::PRECEDING) {
+                self.advance();
+                Some(FrameBound::Preceding(Box::new(expr)))
+            } else if self.is_keyword(Keyword::FOLLOWING) {
+                self.advance();
+                Some(FrameBound::Following(Box::new(expr)))
+            } else {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Expected PRECEDING or FOLLOWING",
+                    &format!("got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                None
+            }
+        }
+    }
+
+    // ── Expression parser (full SQLite expression grammar) ───────────────────
+
+    fn sql_expr(&mut self) -> Option<SqlExpr> {
+        self.sql_expr_or()
+    }
+
+    fn sql_expr_or(&mut self) -> Option<SqlExpr> {
+        let mut left = self.sql_expr_and()?;
+        while self.is_keyword(Keyword::OR) {
+            let op = self.cur().clone();
+            self.advance();
+            let right = self.sql_expr_and()?;
+            left = SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Some(left)
+    }
+
+    fn sql_expr_and(&mut self) -> Option<SqlExpr> {
+        let mut left = self.sql_expr_not()?;
+        while self.is_keyword(Keyword::AND) {
+            let op = self.cur().clone();
+            self.advance();
+            let right = self.sql_expr_not()?;
+            left = SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Some(left)
+    }
+
+    fn sql_expr_not(&mut self) -> Option<SqlExpr> {
+        if self.is_keyword(Keyword::NOT) {
+            let op = self.cur().clone();
+            self.advance();
+            let operand = self.sql_expr_not()?;
+            return Some(SqlExpr::UnaryOp {
+                op,
+                operand: Box::new(operand),
+            });
+        }
+        self.sql_expr_equality()
+    }
+
+    fn sql_expr_equality(&mut self) -> Option<SqlExpr> {
+        let mut left = self.sql_expr_comparison()?;
+
+        loop {
+            // IS [NOT] NULL / IS [NOT] expr
+            if self.is_keyword(Keyword::IS) {
+                self.advance();
+                let negated = if self.is_keyword(Keyword::NOT) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                if self.is_keyword(Keyword::NULL) {
+                    self.advance();
+                    left = SqlExpr::IsNull {
+                        expr: Box::new(left),
+                        negated,
+                    };
+                } else {
+                    // IS [NOT] expr — treat as binary comparison
+                    let right = self.sql_expr_comparison()?;
+                    let op_tok = Token {
+                        ttype: Type::Keyword(if negated {
+                            Keyword::ISNULL
+                        } else {
+                            Keyword::IS
+                        }),
+                        ..self.cur().clone()
+                    };
+                    left = SqlExpr::BinaryOp {
+                        left: Box::new(left),
+                        op: op_tok,
+                        right: Box::new(right),
+                    };
+                }
+                continue;
+            }
+
+            // ISNULL / NOTNULL
+            if self.is_keyword(Keyword::ISNULL) {
+                self.advance();
+                left = SqlExpr::IsNull {
+                    expr: Box::new(left),
+                    negated: false,
+                };
+                continue;
+            }
+            if self.is_keyword(Keyword::NOTNULL) {
+                self.advance();
+                left = SqlExpr::IsNull {
+                    expr: Box::new(left),
+                    negated: true,
+                };
+                continue;
+            }
+
+            // [NOT] IN / LIKE / GLOB / REGEXP / MATCH / BETWEEN
+            let negated = if self.is_keyword(Keyword::NOT) {
+                if let Some(tok) = self.peek_at(1) {
+                    if matches!(
+                        tok.ttype,
+                        Type::Keyword(
+                            Keyword::IN
+                                | Keyword::LIKE
+                                | Keyword::GLOB
+                                | Keyword::REGEXP
+                                | Keyword::MATCH
+                                | Keyword::BETWEEN
+                        )
+                    ) {
+                        self.advance();
+                        true
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                false
+            };
+
+            if self.is_keyword(Keyword::IN) {
+                self.advance();
+                self.consume(Type::BraceLeft);
+                if self.is_keyword(Keyword::SELECT)
+                    || self.is_keyword(Keyword::WITH)
+                    || self.is_keyword(Keyword::VALUES)
+                {
+                    let sel = self.select_stmt_inner()?;
+                    self.consume(Type::BraceRight);
+                    left = SqlExpr::InSelect {
+                        expr: Box::new(left),
+                        negated,
+                        subquery: Box::new(sel),
+                    };
+                } else {
+                    let mut values = vec![];
+                    if !self.is(Type::BraceRight) {
+                        values.push(self.sql_expr()?);
+                        while self.is(Type::Comma) {
+                            self.advance();
+                            values.push(self.sql_expr()?);
+                        }
+                    }
+                    self.consume(Type::BraceRight);
+                    left = SqlExpr::InList {
+                        expr: Box::new(left),
+                        negated,
+                        values,
+                    };
+                }
+                continue;
+            }
+
+            if matches!(
+                self.cur().ttype,
+                Type::Keyword(
+                    Keyword::LIKE | Keyword::GLOB | Keyword::REGEXP | Keyword::MATCH
+                )
+            ) {
+                let op = match &self.cur().ttype {
+                    Type::Keyword(k) => *k,
+                    _ => unreachable!(),
+                };
+                self.advance();
+                let pattern = self.sql_expr_comparison()?;
+                let escape = if self.is_keyword(Keyword::ESCAPE) {
+                    self.advance();
+                    Some(Box::new(self.sql_expr_comparison()?))
+                } else {
+                    None
+                };
+                left = SqlExpr::Like {
+                    expr: Box::new(left),
+                    negated,
+                    op,
+                    pattern: Box::new(pattern),
+                    escape,
+                };
+                continue;
+            }
+
+            if self.is_keyword(Keyword::BETWEEN) {
+                self.advance();
+                let low = self.sql_expr_comparison()?;
+                self.consume_keyword(Keyword::AND);
+                let high = self.sql_expr_comparison()?;
+                left = SqlExpr::Between {
+                    expr: Box::new(left),
+                    negated,
+                    low: Box::new(low),
+                    high: Box::new(high),
+                };
+                continue;
+            }
+
+            // = == != <>
+            if self.is(Type::Equal)
+                || self.is(Type::BangEqual)
+                || self.is(Type::LessGreater)
+            {
+                let op = self.cur().clone();
+                self.advance();
+                let right = self.sql_expr_comparison()?;
+                left = SqlExpr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+                continue;
+            }
+
+            break;
+        }
+
+        Some(left)
+    }
+
+    fn sql_expr_comparison(&mut self) -> Option<SqlExpr> {
+        let mut left = self.sql_expr_bitwise()?;
+        while self.is(Type::Less)
+            || self.is(Type::LessEqual)
+            || self.is(Type::Greater)
+            || self.is(Type::GreaterEqual)
+        {
+            let op = self.cur().clone();
+            self.advance();
+            let right = self.sql_expr_bitwise()?;
+            left = SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Some(left)
+    }
+
+    fn sql_expr_bitwise(&mut self) -> Option<SqlExpr> {
+        let mut left = self.sql_expr_addition()?;
+        while self.is(Type::ShiftLeft)
+            || self.is(Type::ShiftRight)
+            || self.is(Type::Ampersand)
+            || self.is(Type::Pipe)
+        {
+            let op = self.cur().clone();
+            self.advance();
+            let right = self.sql_expr_addition()?;
+            left = SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Some(left)
+    }
+
+    fn sql_expr_addition(&mut self) -> Option<SqlExpr> {
+        let mut left = self.sql_expr_multiplication()?;
+        while self.is(Type::Plus) || self.is(Type::Minus) {
+            let op = self.cur().clone();
+            self.advance();
+            let right = self.sql_expr_multiplication()?;
+            left = SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Some(left)
+    }
+
+    fn sql_expr_multiplication(&mut self) -> Option<SqlExpr> {
+        let mut left = self.sql_expr_concat()?;
+        while self.is(Type::Asterisk) || self.is(Type::Slash) || self.is(Type::Percent) {
+            let op = self.cur().clone();
+            self.advance();
+            let right = self.sql_expr_concat()?;
+            left = SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Some(left)
+    }
+
+    fn sql_expr_concat(&mut self) -> Option<SqlExpr> {
+        let mut left = self.sql_expr_unary()?;
+        while self.is(Type::PipePipe) {
+            let op = self.cur().clone();
+            self.advance();
+            let right = self.sql_expr_unary()?;
+            left = SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Some(left)
+    }
+
+    fn sql_expr_unary(&mut self) -> Option<SqlExpr> {
+        if self.is(Type::Minus) || self.is(Type::Plus) || self.is(Type::Tilde) {
+            let op = self.cur().clone();
+            self.advance();
+            let operand = self.sql_expr_unary()?;
+            return Some(SqlExpr::UnaryOp {
+                op,
+                operand: Box::new(operand),
+            });
+        }
+        self.sql_expr_postfix()
+    }
+
+    fn sql_expr_postfix(&mut self) -> Option<SqlExpr> {
+        let mut left = self.sql_expr_atom()?;
+        while self.is_keyword(Keyword::COLLATE) {
+            self.advance();
+            let collation = self.consume_ident(
+                "https://www.sqlite.org/lang_expr.html",
+                "collation_name",
+            )?;
+            left = SqlExpr::Collate {
+                expr: Box::new(left),
+                collation,
+            };
+        }
+        Some(left)
+    }
+
+    fn sql_expr_atom(&mut self) -> Option<SqlExpr> {
+        match self.cur().ttype.clone() {
+            // Literals
+            Type::String(_)
+            | Type::Number(_)
+            | Type::Blob(_)
+            | Type::Boolean(_)
+            | Type::Keyword(Keyword::NULL)
+            | Type::Keyword(Keyword::CURRENT_TIME)
+            | Type::Keyword(Keyword::CURRENT_DATE)
+            | Type::Keyword(Keyword::CURRENT_TIMESTAMP) => {
+                let tok = self.cur().clone();
+                self.advance();
+                Some(SqlExpr::Literal(tok))
+            }
+
+            // Identifiers: column ref, table.column, schema.table.column, or function call
+            Type::Ident(name) => {
+                self.advance();
+
+                // function call: name(...)
+                if self.is(Type::BraceLeft) {
+                    return self.sql_expr_function_call(name);
+                }
+
+                // dotted: table.column or schema.table.column
+                if self.is(Type::Dot) {
+                    self.advance();
+                    if let Type::Ident(name2) = self.cur().ttype.clone() {
+                        self.advance();
+                        if self.is(Type::Dot) {
+                            self.advance();
+                            if let Type::Ident(name3) = self.cur().ttype.clone() {
+                                self.advance();
+                                return Some(SqlExpr::ColumnRef {
+                                    schema: Some(name),
+                                    table: Some(name2),
+                                    column: name3,
+                                });
+                            }
+                        }
+                        return Some(SqlExpr::ColumnRef {
+                            schema: None,
+                            table: Some(name),
+                            column: name2,
+                        });
+                    } else if let Type::Asterisk = &self.cur().ttype {
+                        // table.* inside expression context (e.g. EXISTS check)
+                        self.advance();
+                        return Some(SqlExpr::ColumnRef {
+                            schema: None,
+                            table: Some(name),
+                            column: "*".into(),
+                        });
+                    }
+                }
+
+                Some(SqlExpr::ColumnRef {
+                    schema: None,
+                    table: None,
+                    column: name,
+                })
+            }
+
+            // Parenthesized expression or subquery
+            Type::BraceLeft => {
+                self.advance();
+                if self.is_keyword(Keyword::SELECT)
+                    || self.is_keyword(Keyword::WITH)
+                    || self.is_keyword(Keyword::VALUES)
+                {
+                    let sel = self.select_stmt_inner()?;
+                    self.consume(Type::BraceRight);
+                    return Some(SqlExpr::Subquery(Box::new(sel)));
+                }
+                let expr = self.sql_expr()?;
+                self.consume(Type::BraceRight);
+                Some(SqlExpr::Paren(Box::new(expr)))
+            }
+
+            // CAST(expr AS type)
+            Type::Keyword(Keyword::CAST) => {
+                self.advance();
+                self.consume(Type::BraceLeft);
+                let expr = self.sql_expr()?;
+                self.consume_keyword(Keyword::AS);
+                let type_name = self.consume_ident(
+                    "https://www.sqlite.org/lang_expr.html",
+                    "type_name",
+                )?;
+                self.consume(Type::BraceRight);
+                Some(SqlExpr::Cast {
+                    expr: Box::new(expr),
+                    type_name,
+                })
+            }
+
+            // CASE
+            Type::Keyword(Keyword::CASE) => {
+                self.advance();
+                let operand = if !self.is_keyword(Keyword::WHEN) {
+                    Some(Box::new(self.sql_expr()?))
+                } else {
+                    None
+                };
+                let mut when_clauses = vec![];
+                while self.is_keyword(Keyword::WHEN) {
+                    self.advance();
+                    let w = self.sql_expr()?;
+                    self.consume_keyword(Keyword::THEN);
+                    let t = self.sql_expr()?;
+                    when_clauses.push((w, t));
+                }
+                let else_clause = if self.is_keyword(Keyword::ELSE) {
+                    self.advance();
+                    Some(Box::new(self.sql_expr()?))
+                } else {
+                    None
+                };
+                self.consume_keyword(Keyword::END);
+                Some(SqlExpr::Case {
+                    operand,
+                    when_clauses,
+                    else_clause,
+                })
+            }
+
+            // EXISTS (subquery)
+            Type::Keyword(Keyword::EXISTS) => {
+                self.advance();
+                self.consume(Type::BraceLeft);
+                let sel = self.select_stmt_inner()?;
+                self.consume(Type::BraceRight);
+                Some(SqlExpr::Exists {
+                    negated: false,
+                    subquery: Box::new(sel),
+                })
+            }
+
+            // Bind parameters
+            Type::Question => {
+                let tok = self.cur().clone();
+                self.advance();
+                let counter = if let Type::Number(_) = &self.cur().ttype {
+                    let c = self.cur().clone();
+                    self.advance();
+                    Some(c)
+                } else {
+                    None
+                };
+                Some(SqlExpr::BindParam {
+                    token: tok,
+                    name: None,
+                    counter,
+                })
+            }
+            Type::Colon | Type::At | Type::Dollar => {
+                let tok = self.cur().clone();
+                self.advance();
+                if let Type::Ident(n) = &self.cur().ttype {
+                    let n = n.clone();
+                    self.advance();
+                    Some(SqlExpr::BindParam {
+                        token: tok,
+                        name: Some(n),
+                        counter: None,
+                    })
+                } else {
+                    let cur = self.cur().clone();
+                    self.push_err(
+                        "Invalid bind parameter",
+                        &format!("expected identifier after bind prefix, got {:?}", cur.ttype),
+                        &cur,
+                        Rule::Syntax,
+                    );
+                    None
+                }
+            }
+
+            // Star — used inside COUNT(*) etc.
+            Type::Asterisk => {
+                self.advance();
+                Some(SqlExpr::Star)
+            }
+
+            _ => {
+                let cur = self.cur().clone();
+                self.push_err(
+                    "Unexpected Token in expression",
+                    &format!("expected expression, got {:?}", cur.ttype),
+                    &cur,
+                    Rule::Syntax,
+                );
+                None
+            }
+        }
+    }
+
+    fn sql_expr_function_call(&mut self, name: String) -> Option<SqlExpr> {
+        self.advance(); // skip '('
+
+        let distinct = if self.is_keyword(Keyword::DISTINCT) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let mut args = vec![];
+        if self.is(Type::Asterisk) {
+            args.push(SqlExpr::Star);
+            self.advance();
+        } else if !self.is(Type::BraceRight) {
+            args.push(self.sql_expr()?);
+            while self.is(Type::Comma) {
+                self.advance();
+                args.push(self.sql_expr()?);
+            }
+        }
+        self.consume(Type::BraceRight);
+
+        // FILTER / OVER for window functions
+        let filter = if self.is_keyword(Keyword::FILTER) {
+            self.advance();
+            self.consume(Type::BraceLeft);
+            self.consume_keyword(Keyword::WHERE);
+            let f = self.sql_expr()?;
+            self.consume(Type::BraceRight);
+            Some(Box::new(f))
+        } else {
+            None
+        };
+
+        if self.is_keyword(Keyword::OVER) {
+            self.advance();
+            let over = self.window_over()?;
+            return Some(SqlExpr::WindowFunctionCall {
+                name,
+                distinct,
+                args,
+                filter,
+                over: Box::new(over),
+            });
+        }
+
+        Some(SqlExpr::FunctionCall {
+            name,
+            distinct,
+            args,
+        })
+    }
 
     /// https://www.sqlite.org/lang_createindex.html
     #[cfg_attr(feature = "trace", trace)]
