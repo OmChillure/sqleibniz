@@ -872,6 +872,138 @@ mod should_pass_select {
 }
 
 #[cfg(test)]
+mod should_pass_create_table {
+    test_group_pass! {
+        create_table_basic,
+        simple:
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+        if_not_exists:
+            "CREATE TABLE IF NOT EXISTS users (id INTEGER, name TEXT);",
+        temp:
+            "CREATE TEMP TABLE tmp (val TEXT);",
+        temporary:
+            "CREATE TEMPORARY TABLE tmp (val TEXT);",
+        multiple_columns:
+            "CREATE TABLE t (a INTEGER, b TEXT, c REAL, d BLOB);",
+        with_constraints:
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL);",
+        with_default:
+            "CREATE TABLE t (id INTEGER, status TEXT DEFAULT 'active');",
+        with_foreign_key:
+            "CREATE TABLE orders (id INTEGER, user_id INTEGER REFERENCES users(id));",
+        schema_qualified:
+            "CREATE TABLE main.users (id INTEGER);",
+        without_rowid:
+            "CREATE TABLE t (id INTEGER PRIMARY KEY) WITHOUT ROWID;",
+        multiple_tables:
+            "CREATE TABLE a (id INTEGER); CREATE TABLE b (id INTEGER);",
+        create_as_select:
+            "CREATE TABLE archive AS SELECT * FROM users;"
+    }
+}
+
+#[cfg(test)]
+mod should_pass_insert {
+    test_group_pass! {
+        insert_basic,
+        simple_values:
+            "INSERT INTO users VALUES (1, 'Alice');",
+        with_columns:
+            "INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');",
+        multiple_rows:
+            "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');",
+        or_replace:
+            "INSERT OR REPLACE INTO users VALUES (1, 'Alice');",
+        or_ignore:
+            "INSERT OR IGNORE INTO users VALUES (1, 'Alice');",
+        or_abort:
+            "INSERT OR ABORT INTO users VALUES (1, 'Alice');",
+        or_rollback:
+            "INSERT OR ROLLBACK INTO users VALUES (1, 'Alice');",
+        or_fail:
+            "INSERT OR FAIL INTO users VALUES (1, 'Alice');",
+        replace_shorthand:
+            "REPLACE INTO users VALUES (1, 'Alice');",
+        default_values:
+            "INSERT INTO users DEFAULT VALUES;",
+        insert_select:
+            "INSERT INTO archive SELECT * FROM users;",
+        schema_qualified:
+            "INSERT INTO main.users VALUES (1, 'Alice');",
+        with_expressions:
+            "INSERT INTO t VALUES (1 + 2, 'hello' || ' world');"
+    }
+}
+
+#[cfg(test)]
+mod should_pass_update {
+    test_group_pass! {
+        update_basic,
+        simple:
+            "UPDATE users SET name = 'Bob';",
+        with_where:
+            "UPDATE users SET name = 'Bob' WHERE id = 1;",
+        multiple_set:
+            "UPDATE users SET name = 'Bob', email = 'bob@example.com' WHERE id = 1;",
+        or_replace:
+            "UPDATE OR REPLACE users SET name = 'Bob';",
+        or_ignore:
+            "UPDATE OR IGNORE users SET name = 'Bob';",
+        schema_qualified:
+            "UPDATE main.users SET name = 'Bob';",
+        with_alias:
+            "UPDATE users AS u SET name = 'Bob' WHERE u.id = 1;",
+        with_expression:
+            "UPDATE inventory SET qty = qty - 1 WHERE product_id = 42;"
+    }
+}
+
+#[cfg(test)]
+mod should_pass_delete {
+    test_group_pass! {
+        delete_basic,
+        simple:
+            "DELETE FROM users;",
+        with_where:
+            "DELETE FROM users WHERE id = 1;",
+        schema_qualified:
+            "DELETE FROM main.users WHERE id = 1;",
+        complex_where:
+            "DELETE FROM log WHERE created_at < '2024-01-01' AND level = 'debug';"
+    }
+}
+
+#[cfg(test)]
+mod should_fail_create_insert_update_delete {
+    test_group_fail! {
+        create_table_negative,
+        create_no_table_name:       "CREATE TABLE;",
+        create_no_columns:          "CREATE TABLE t;",
+        create_no_paren:            "CREATE TABLE t id INTEGER;"
+    }
+
+    test_group_fail! {
+        insert_negative,
+        insert_no_into:             "INSERT VALUES (1);",
+        insert_no_table:            "INSERT INTO;",
+        insert_no_values:           "INSERT INTO t;"
+    }
+
+    test_group_fail! {
+        update_negative,
+        update_no_table:            "UPDATE;",
+        update_no_set:              "UPDATE t;",
+        update_set_no_col:          "UPDATE t SET;"
+    }
+
+    test_group_fail! {
+        delete_negative,
+        delete_no_from:             "DELETE;",
+        delete_no_table:            "DELETE FROM;"
+    }
+}
+
+#[cfg(test)]
 mod should_fail {
     test_group_fail! {
         negative_tests,

@@ -45,6 +45,10 @@ macro_rules! node {
             fn doc(&self) -> &str {
                 $documentation
             }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
         }
 
         #[cfg(test)]
@@ -75,9 +79,8 @@ pub trait Node: std::fmt::Debug {
     fn as_serializable(&self) -> serde_json::Value;
     /// returns the documentation url for sefl
     fn doc(&self) -> &str;
-
-    // TODO: every node should analyse its own contents after the ast was build, to do so the Node
-    // trait should enforce a analyse(&self, ctx &types::ctx::Context) -> Vec<Error> function.
+    /// returns self as &dyn Any for downcasting in the semantic analyzer
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 node!(
@@ -490,6 +493,7 @@ node!(
 pub enum SqlExpr {
     Literal(Token),
     ColumnRef {
+        token: Token,
         schema: Option<String>,
         table: Option<String>,
         column: String,
@@ -589,6 +593,7 @@ pub struct FromClause {
 
 #[derive(Debug)]
 pub struct TableRef {
+    pub token: Token,
     pub source: TableSource,
     pub alias: Option<String>,
     pub indexed: Option<IndexedBy>,
@@ -757,6 +762,107 @@ SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY 1;
     order_by: Vec<OrderingTerm>,
     limit: Option<SqlExpr>,
     offset: Option<SqlExpr>
+);
+
+// ── CREATE TABLE ─────────────────────────────────────────────────────────────
+node!(
+    CreateTable,
+    r"CREATE TABLE statement, see: https://www.sqlite.org/lang_createtable.html
+
+The CREATE TABLE command is used to create a new table in an SQLite database.
+
+# Examples
+
+```sql
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS orders (id INTEGER, user_id INTEGER REFERENCES users(id));
+CREATE TEMP TABLE temp_data (val TEXT);
+```
+",
+    if_not_exists: bool,
+    schema: Option<String>,
+    name: String,
+    columns: Vec<ColumnDef>,
+    temporary: bool
+);
+
+// ── INSERT ───────────────────────────────────────────────────────────────────
+
+/// A single SET column = expr clause in an UPDATE statement
+#[derive(Debug)]
+pub struct SetClause {
+    pub column: String,
+    pub column_token: Token,
+    pub expr: SqlExpr,
+}
+
+node!(
+    InsertStmt,
+    r"INSERT statement, see: https://www.sqlite.org/lang_insert.html
+
+The INSERT command creates new rows in a table.
+
+# Examples
+
+```sql
+INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
+INSERT OR REPLACE INTO users VALUES (1, 'Bob', 'bob@example.com');
+INSERT INTO log SELECT * FROM temp_log;
+```
+",
+    or_action: Option<Keyword>,
+    schema: Option<String>,
+    table: String,
+    table_token: Token,
+    columns: Vec<String>,
+    values: Vec<Vec<SqlExpr>>,
+    select: Option<Box<SelectStmt>>,
+    default_values: bool
+);
+
+// ── UPDATE ───────────────────────────────────────────────────────────────────
+node!(
+    UpdateStmt,
+    r"UPDATE statement, see: https://www.sqlite.org/lang_update.html
+
+The UPDATE command changes existing rows in a table.
+
+# Examples
+
+```sql
+UPDATE users SET name = 'Bob' WHERE id = 1;
+UPDATE OR IGNORE inventory SET qty = qty - 1 WHERE product_id = 42;
+```
+",
+    or_action: Option<Keyword>,
+    schema: Option<String>,
+    table: String,
+    table_token: Token,
+    alias: Option<String>,
+    set_clauses: Vec<SetClause>,
+    from: Option<FromClause>,
+    where_clause: Option<SqlExpr>
+);
+
+// ── DELETE ───────────────────────────────────────────────────────────────────
+node!(
+    DeleteStmt,
+    r"DELETE statement, see: https://www.sqlite.org/lang_delete.html
+
+The DELETE command removes rows from a table.
+
+# Examples
+
+```sql
+DELETE FROM users WHERE id = 1;
+DELETE FROM log;
+```
+",
+    schema: Option<String>,
+    table: String,
+    table_token: Token,
+    alias: Option<String>,
+    where_clause: Option<SqlExpr>
 );
 
 #[derive(Debug, serde::Serialize)]

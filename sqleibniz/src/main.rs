@@ -5,6 +5,7 @@ use std::time::SystemTime;
 use std::{fs, process::exit, vec};
 
 use clap::Parser;
+use sqleibniz::analyzer::Analyzer;
 use sqleibniz::error::{self, Error, print_str_colored, warn};
 use sqleibniz::highlight::builder;
 use sqleibniz::lexer::Lexer;
@@ -212,6 +213,11 @@ fn main() {
             }
 
             errors.append(&mut parser.errors);
+
+            // Semantic analysis: build symbol table from CREATE TABLEs, check DML
+            let mut analyzer = Analyzer::new(file.name.as_str());
+            analyzer.analyze(&ast);
+            errors.append(&mut analyzer.errors);
         }
 
         let mut processed_errors = errors

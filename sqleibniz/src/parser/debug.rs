@@ -114,7 +114,7 @@ impl FieldSerializable for SqlExpr {
                 "kind": "literal",
                 "value": tok.field_as_serializable(),
             }),
-            SqlExpr::ColumnRef { schema, table, column } => serde_json::json!({
+            SqlExpr::ColumnRef { token: _, schema, table, column } => serde_json::json!({
                 "kind": "column_ref",
                 "schema": schema,
                 "table": table,
@@ -249,6 +249,21 @@ impl FieldSerializable for TableRef {
             "source": self.source.field_as_serializable(),
             "alias": self.alias,
             "indexed": self.indexed.as_ref().map(|i| i.field_as_serializable()),
+        })
+    }
+}
+
+impl FieldSerializable for Box<SelectStmt> {
+    fn field_as_serializable(&self) -> serde_json::Value {
+        Node::as_serializable(self.as_ref())
+    }
+}
+
+impl FieldSerializable for SetClause {
+    fn field_as_serializable(&self) -> serde_json::Value {
+        serde_json::json!({
+            "column": self.column,
+            "expr": self.expr.field_as_serializable(),
         })
     }
 }

@@ -30,6 +30,14 @@ pub enum Rule {
     Syntax,
     /// The source file is missing a semicolon
     Semicolon,
+    /// A table referenced in a DML statement does not exist in any CREATE TABLE
+    UnknownTable,
+    /// A column referenced in a DML statement does not exist in the target table
+    UnknownColumn,
+    /// An INSERT statement provides a different number of values than the target table has columns
+    InsertValueCountMismatch,
+    /// A comparison or operation between incompatible SQLite storage classes
+    TypeMismatch,
 }
 
 impl mlua::FromLua for Rule {
@@ -50,6 +58,10 @@ impl mlua::FromLua for Rule {
             "UnknownKeyword" => Self::UnknownKeyword,
             "SqliteUnsupported" => Self::SqliteUnsupported,
             "Quirk" => Self::Quirk,
+            "UnknownTable" => Self::UnknownTable,
+            "UnknownColumn" => Self::UnknownColumn,
+            "InsertValueCountMismatch" => Self::InsertValueCountMismatch,
+            "TypeMismatch" => Self::TypeMismatch,
             _ => {
                 return Err(mlua::Error::FromLuaConversionError {
                     from: "string",
@@ -77,6 +89,10 @@ impl Rule {
             Self::BadSqleibnizInstruction => "BadSqleibnizInstruction",
             Self::UnknownKeyword => "UnknownKeyword",
             Self::SqliteUnsupported => "SqliteUnsupported",
+            Self::UnknownTable => "UnknownTable",
+            Self::UnknownColumn => "UnknownColumn",
+            Self::InsertValueCountMismatch => "InsertValueCountMismatch",
+            Self::TypeMismatch => "TypeMismatch",
         }
     }
 
@@ -99,6 +115,14 @@ impl Rule {
             Self::Quirk => "Sqlite or SQL quirk: https://www.sqlite.org/quirks.html",
             Self::UnknownKeyword => "Source file contains an unknown keyword",
             Self::SqliteUnsupported => "Source file uses sql features sqlite does not support",
+            Self::UnknownTable => "A referenced table does not exist in any CREATE TABLE",
+            Self::UnknownColumn => "A referenced column does not exist in the target table",
+            Self::InsertValueCountMismatch => {
+                "INSERT provides a different number of values than the table has columns"
+            }
+            Self::TypeMismatch => {
+                "A comparison or operation between incompatible SQLite storage classes"
+            }
         }
     }
 }
