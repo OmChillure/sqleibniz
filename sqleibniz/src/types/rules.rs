@@ -38,6 +38,16 @@ pub enum Rule {
     InsertValueCountMismatch,
     /// A comparison or operation between incompatible SQLite storage classes
     TypeMismatch,
+    /// Using = NULL or != NULL instead of IS NULL / IS NOT NULL
+    EqualNull,
+    /// LIKE pattern contains no wildcards (% or _)
+    LikeNoWildcards,
+    /// BETWEEN bounds are reversed (low > high)
+    ReversedBetween,
+    /// UPDATE or DELETE without WHERE clause
+    MissingWhere,
+    /// Trailing comma in a list (e.g. SELECT a, FROM t)
+    TrailingComma,
 }
 
 impl mlua::FromLua for Rule {
@@ -62,6 +72,11 @@ impl mlua::FromLua for Rule {
             "UnknownColumn" => Self::UnknownColumn,
             "InsertValueCountMismatch" => Self::InsertValueCountMismatch,
             "TypeMismatch" => Self::TypeMismatch,
+            "EqualNull" => Self::EqualNull,
+            "LikeNoWildcards" => Self::LikeNoWildcards,
+            "ReversedBetween" => Self::ReversedBetween,
+            "MissingWhere" => Self::MissingWhere,
+            "TrailingComma" => Self::TrailingComma,
             _ => {
                 return Err(mlua::Error::FromLuaConversionError {
                     from: "string",
@@ -93,6 +108,11 @@ impl Rule {
             Self::UnknownColumn => "UnknownColumn",
             Self::InsertValueCountMismatch => "InsertValueCountMismatch",
             Self::TypeMismatch => "TypeMismatch",
+            Self::EqualNull => "EqualNull",
+            Self::LikeNoWildcards => "LikeNoWildcards",
+            Self::ReversedBetween => "ReversedBetween",
+            Self::MissingWhere => "MissingWhere",
+            Self::TrailingComma => "TrailingComma",
         }
     }
 
@@ -123,6 +143,11 @@ impl Rule {
             Self::TypeMismatch => {
                 "A comparison or operation between incompatible SQLite storage classes"
             }
+            Self::EqualNull => "Using = NULL or != NULL instead of IS NULL / IS NOT NULL",
+            Self::LikeNoWildcards => "LIKE pattern has no wildcards (% or _), use = instead",
+            Self::ReversedBetween => "BETWEEN bounds appear reversed (low > high)",
+            Self::MissingWhere => "UPDATE or DELETE without a WHERE clause affects all rows",
+            Self::TrailingComma => "Trailing comma in a list",
         }
     }
 }

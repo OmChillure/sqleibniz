@@ -11,6 +11,23 @@ pub struct ImprovedLine {
     pub start: usize,
 }
 
+/// A structured quick-fix suggestion attached to a diagnostic.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Suggestion {
+    /// Human-readable description, e.g. "Replace `SLECT` with `SELECT`"
+    pub message: String,
+    /// The replacement text to apply
+    pub replacement: String,
+    /// Start line of the range to replace (0-based)
+    pub start_line: usize,
+    /// Start column of the range to replace (0-based)
+    pub start_col: usize,
+    /// End line of the range to replace (0-based)
+    pub end_line: usize,
+    /// End column of the range to replace (0-based)
+    pub end_col: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Error {
     pub file: String,
@@ -22,6 +39,7 @@ pub struct Error {
     pub end: usize,
     pub improved_line: Option<ImprovedLine>,
     pub doc_url: Option<&'static str>,
+    pub suggestion: Option<Suggestion>,
 }
 
 #[derive(Debug)]
@@ -168,6 +186,12 @@ impl Error {
         if self.doc_url.is_some() {
             print_str_colored(b, "    ~ docs: ", Color::Blue);
             b.write_str(self.doc_url.unwrap());
+            b.write_char('\n');
+        }
+
+        if let Some(ref suggestion) = self.suggestion {
+            print_str_colored(b, "    ~ fix: ", Color::Green);
+            b.write_str(&suggestion.message);
             b.write_char('\n');
         }
 

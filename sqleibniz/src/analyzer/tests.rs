@@ -35,6 +35,30 @@ mod analyzer_tests {
             .collect()
     }
 
+    /// Helper: lex + parse + analyze, return full errors including suggestions
+    fn analyze_full(input: &str) -> Vec<crate::error::Error> {
+        let bytes = input.as_bytes().to_vec();
+        let mut lexer = Lexer::new(&bytes, "test");
+        let toks = lexer.run();
+        assert!(
+            lexer.errors.is_empty(),
+            "lexer errors: {:?}",
+            lexer.errors
+        );
+
+        let mut parser = Parser::new(toks, "test");
+        let ast = parser.parse();
+        assert!(
+            parser.errors.is_empty(),
+            "parser errors: {:?}",
+            parser.errors
+        );
+
+        let mut analyzer = Analyzer::new("test");
+        analyzer.analyze(&ast);
+        analyzer.errors
+    }
+
     /// Helper: run analysis and assert no errors
     fn analyze_ok(input: &str) {
         let errs = analyze(input);
@@ -49,6 +73,29 @@ mod analyzer_tests {
             "expected error {:?} but got: {:?}",
             expected_rule,
             errs
+        );
+    }
+
+    /// Helper: assert a suggestion exists for the given rule with expected message substring
+    fn analyze_has_suggestion(input: &str, expected_rule: Rule, message_contains: &str) {
+        let errs = analyze_full(input);
+        let matching = errs
+            .iter()
+            .find(|e| e.rule == expected_rule && e.suggestion.is_some());
+        assert!(
+            matching.is_some(),
+            "expected suggestion for {:?}, got errors: {:?}",
+            expected_rule,
+            errs.iter()
+                .map(|e| (&e.rule, &e.suggestion))
+                .collect::<Vec<_>>()
+        );
+        let suggestion = matching.unwrap().suggestion.as_ref().unwrap();
+        assert!(
+            suggestion.message.contains(message_contains),
+            "expected suggestion message to contain '{}', got: '{}'",
+            message_contains,
+            suggestion.message
         );
     }
 
@@ -227,9 +274,20 @@ mod analyzer_tests {
 
     #[test]
     fn update_valid_column() {
-        analyze_ok(
+        // UPDATE without WHERE now triggers MissingWhere; the column itself is valid
+        let errs = analyze(
             "CREATE TABLE users (id INTEGER, name TEXT);
              UPDATE users SET name = 'Bob';",
+        );
+        assert!(
+            !errs.iter().any(|(r, _)| *r == Rule::UnknownColumn),
+            "should not have UnknownColumn, got: {:?}",
+            errs
+        );
+        assert!(
+            errs.iter().any(|(r, _)| *r == Rule::MissingWhere),
+            "expected MissingWhere, got: {:?}",
+            errs
         );
     }
 
@@ -342,9 +400,11 @@ mod analyzer_tests {
 
     #[test]
     fn no_type_mismatch_for_null() {
-        analyze_ok(
+        // = NULL now triggers EqualNull (not TypeMismatch), which is the correct diagnostic
+        analyze_has_error(
             "CREATE TABLE users (id INTEGER, name TEXT);
              SELECT * FROM users WHERE name = NULL;",
+            Rule::EqualNull,
         );
     }
 
@@ -515,5 +575,182 @@ mod analyzer_tests {
              INSERT INTO users VALUES (1, 'Alice', 'extra');",
         );
         assert!(errs.len() >= 2, "expected at least 2 errors, got: {:?}", errs);
+    }
+
+    // ── = NULL / != NULL detection ───────────────────────────────────────────
+
+    #[test]
+    fn equal_null_detected() {
+        analyze_has_error(
+            "SELECT * FROM t WHERE name = NULL;",
+            Rule::EqualNull,
+        );
+    }
+
+    #[test]
+    fn not_equal_null_detected() {
+        analyze_has_error(
+            "SELECT * FROM t WHERE name != NULL;",
+            Rule::EqualNull,
+        );
+    }
+
+    #[test]
+    fn less_greater_null_detected() {
+        analyze_has_error(
+            "SELECT * FROM t WHERE name <> NULL;",
+            Rule::EqualNull,
+        );
+    }
+
+    #[test]
+    fn is_null_no_false_positive() {
+        analyze_ok("SELECT * FROM t WHERE name IS NULL;");
+    }
+
+    #[test]
+    fn is_not_null_no_false_positive() {
+        analyze_ok("SELECT * FROM t WHERE name IS NOT NULL;");
+    }
+
+    #[test]
+    fn equal_null_suggestion_text() {
+        analyze_has_suggestion(
+            "SELECT * FROM t WHERE name = NULL;",
+            Rule::EqualNull,
+            "IS NULL",
+        );
+    }
+
+    #[test]
+    fn not_equal_null_suggestion_text() {
+        analyze_has_suggestion(
+            "SELECT * FROM t WHERE name != NULL;",
+            Rule::EqualNull,
+            "IS NOT NULL",
+        );
+    }
+
+    // ── LIKE with no wildcards ───────────────────────────────────────────────
+
+    #[test]
+    fn like_no_wildcards_detected() {
+        analyze_has_error(
+            "SELECT * FROM t WHERE name LIKE 'alice';",
+            Rule::LikeNoWildcards,
+        );
+    }
+
+    #[test]
+    fn like_with_percent_ok() {
+        analyze_ok("SELECT * FROM t WHERE name LIKE '%alice%';");
+    }
+
+    #[test]
+    fn like_with_underscore_ok() {
+        analyze_ok("SELECT * FROM t WHERE name LIKE '_lice';");
+    }
+
+    #[test]
+    fn like_no_wildcards_suggestion_text() {
+        analyze_has_suggestion(
+            "SELECT * FROM t WHERE name LIKE 'alice';",
+            Rule::LikeNoWildcards,
+            "= 'alice'",
+        );
+    }
+
+    // ── Reversed BETWEEN bounds ──────────────────────────────────────────────
+
+    #[test]
+    fn reversed_between_detected() {
+        analyze_has_error(
+            "SELECT * FROM t WHERE id BETWEEN 10 AND 1;",
+            Rule::ReversedBetween,
+        );
+    }
+
+    #[test]
+    fn normal_between_ok() {
+        analyze_ok("SELECT * FROM t WHERE id BETWEEN 1 AND 10;");
+    }
+
+    #[test]
+    fn reversed_between_suggestion_text() {
+        analyze_has_suggestion(
+            "SELECT * FROM t WHERE id BETWEEN 10 AND 1;",
+            Rule::ReversedBetween,
+            "BETWEEN 1 AND 10",
+        );
+    }
+
+    // ── Missing WHERE on UPDATE/DELETE ────────────────────────────────────────
+
+    #[test]
+    fn update_without_where_detected() {
+        analyze_has_error(
+            "CREATE TABLE users (id INTEGER, name TEXT);
+             UPDATE users SET name = 'Bob';",
+            Rule::MissingWhere,
+        );
+    }
+
+    #[test]
+    fn update_with_where_ok() {
+        analyze_ok(
+            "CREATE TABLE users (id INTEGER, name TEXT);
+             UPDATE users SET name = 'Bob' WHERE id = 1;",
+        );
+    }
+
+    #[test]
+    fn delete_without_where_detected() {
+        analyze_has_error(
+            "CREATE TABLE users (id INTEGER, name TEXT);
+             DELETE FROM users;",
+            Rule::MissingWhere,
+        );
+    }
+
+    #[test]
+    fn delete_with_where_ok() {
+        analyze_ok(
+            "CREATE TABLE users (id INTEGER, name TEXT);
+             DELETE FROM users WHERE id = 1;",
+        );
+    }
+
+    #[test]
+    fn missing_where_suggestion_text() {
+        analyze_has_suggestion(
+            "CREATE TABLE users (id INTEGER, name TEXT);
+             UPDATE users SET name = 'Bob';",
+            Rule::MissingWhere,
+            "WHERE",
+        );
+    }
+
+    // ── Suggestion presence for unknown table ────────────────────────────────
+
+    #[test]
+    fn unknown_table_has_suggestion() {
+        analyze_has_suggestion(
+            "CREATE TABLE users (id INTEGER);
+             SELECT * FROM usres;",
+            Rule::UnknownTable,
+            "users",
+        );
+    }
+
+    // ── Suggestion presence for unknown column ───────────────────────────────
+
+    #[test]
+    fn unknown_column_has_suggestion() {
+        analyze_has_suggestion(
+            "CREATE TABLE users (id INTEGER, name TEXT);
+             SELECT naem FROM users;",
+            Rule::UnknownColumn,
+            "name",
+        );
     }
 }

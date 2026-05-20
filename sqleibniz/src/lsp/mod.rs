@@ -4,10 +4,10 @@ mod handlers;
 use error::LspError;
 use lsp_server::{Connection, ExtractError, Message, Notification, Request, RequestId};
 use lsp_types::{
-    DiagnosticOptions, InitializeParams, SaveOptions, ServerCapabilities, TextDocumentSyncKind,
-    TextDocumentSyncOptions,
+    CodeActionProviderCapability, DiagnosticOptions, InitializeParams, SaveOptions,
+    ServerCapabilities, TextDocumentSyncKind, TextDocumentSyncOptions,
     notification::{DidChangeTextDocument, DidOpenTextDocument},
-    request::{DocumentDiagnosticRequest, HoverRequest},
+    request::{CodeActionRequest, DocumentDiagnosticRequest, HoverRequest},
 };
 
 use crate::{
@@ -33,6 +33,7 @@ pub fn start() -> Result<(), LspError> {
                 ..Default::default()
             },
         )),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         text_document_sync: Some(lsp_types::TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
@@ -104,6 +105,22 @@ fn event_loop(connection: Connection, params: serde_json::Value) -> Result<(), L
                                 if let Err(e) = handlers::diagnostic::handle(
                                     &connection,
                                     errors.clone(),
+                                    id,
+                                    params,
+                                ) {
+                                    eprintln!("[sqleibniz]: err: {}", e);
+                                }
+                                continue;
+                            }
+                            Err(err) => panic!("{err:?}"),
+                        };
+                    }
+                    "textDocument/codeAction" => {
+                        match cast::<CodeActionRequest>(req) {
+                            Ok((id, params)) => {
+                                if let Err(e) = handlers::code_action::handle(
+                                    &connection,
+                                    &errors,
                                     id,
                                     params,
                                 ) {
